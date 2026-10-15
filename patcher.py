@@ -527,6 +527,25 @@ def ensure_and_patch_language_server_bin(force: bool = False) -> None:
             os.remove(ent_plist)
 
 
+def patch_ipc_handlers(dist_dir: str) -> None:
+    ipc_path = os.path.join(dist_dir, "ipcHandlers.js")
+    if not os.path.isfile(ipc_path):
+        return
+    with open(ipc_path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    replacements = [
+        ("title: 'Open workspace'", "title: '打开工作区'"),
+        ("title: 'Open workspaces'", "title: '打开工作区'"),
+    ]
+    for old, new in replacements:
+        content = content.replace(old, new)
+
+    with open(ipc_path, "w", encoding="utf-8") as f:
+        f.write(content)
+    log("已汉化主进程文件选择对话框 -> dist/ipcHandlers.js")
+
+
 def apply_all_patches_to_dir(app_dir: str, locale_data: dict, engine_code: str) -> None:
     dist_dir = os.path.join(app_dir, "dist")
     patch_preload(dist_dir, locale_data, engine_code)
@@ -534,6 +553,7 @@ def apply_all_patches_to_dir(app_dir: str, locale_data: dict, engine_code: str) 
     patch_menu(dist_dir, locale_data.get("menu", {}))
     patch_tray(dist_dir)
     patch_main(dist_dir)
+    patch_ipc_handlers(dist_dir)
     patch_loading_overlay(dist_dir)
     patch_wizard_html(dist_dir)
     patch_language_server_js(dist_dir)

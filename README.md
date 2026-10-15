@@ -18,7 +18,7 @@
 确保您的 Mac 已安装 `/Applications/Antigravity.app`，打开「终端 (Terminal)」依次运行以下命令：
 
 ```bash
-git clone https://github.com/Eric2077x/antigravity-zh.git
+git clone https://github.com/<你的GitHub用户名>/antigravity-zh.git
 cd antigravity-zh
 python3 patcher.py
 ```
