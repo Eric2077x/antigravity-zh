@@ -8,7 +8,7 @@ Architecture & Security Guarantees:
   - Path-traversal & symlink-escape protection (ASAR-Slip defense)
   - SHA256 version tracking (.zh_asar_sha256, .zh_ls_sha256, ~/.antigravity-zh/backup/gemini_agy.sha256)
   - Out-of-bundle backups (~/.antigravity-zh/backup/) with zero modification to Gemini.app outer seal or MacOS/Gemini
-  - Never replaces Gemini.app/Contents/Helpers/agy with external ~/.local/bin/agy binaries
+  - Upgrades Gemini.app/Contents/Helpers/agy base strictly from official ~/.local/bin/agy only when newer (never downgrades)
   - Self-reference-free LaunchAgent guard via persistent guard-runner.sh + stable parent WatchPaths + 60s patrol
   - Lock file strictly under /tmp/antigravity-zh-{uid}.lock with O_NOFOLLOW & uid ownership verification
 """
@@ -1244,6 +1244,144 @@ def get_gemini_backup_paths(home_dir: str) -> tuple[str, str, str]:
     return backup_dir, orig_path, sha_path
 
 
+def _parse_semver(raw: str) -> tuple[int, ...] | None:
+    """Parses leading dotted numeric version (e.g. '1.5.7') into a comparable tuple."""
+    m = re.search(r"(\d+(?:\.\d+)+)", (raw or "").strip())
+    if not m:
+        return None
+    try:
+        return tuple(int(p) for p in m.group(1).split("."))
+    except ValueError:
+        return None
+
+
+def _load_gemini_ver_cache(backup_dir: str) -> dict:
+    ver_file = os.path.join(backup_dir, "gemini_agy.ver")
+    if os.path.isfile(ver_file) and not os.path.islink(ver_file):
+        try:
+            with open(ver_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+    return {}
+
+
+def _save_gemini_ver_cache(backup_dir: str, cache: dict) -> None:
+    ver_file = os.path.join(backup_dir, "gemini_agy.ver")
+    try:
+        _write_exclusive_atomic(ver_file, json.dumps(cache, ensure_ascii=False, indent=2).encode("utf-8"), 0o600)
+    except Exception:
+        pass
+
+
+def _probe_agy_version_str(bin_path: str, allow_chmod: bool = False) -> str | None:
+    """Runs `<agy> --version` safely and returns the raw version line if valid."""
+    if not os.path.isfile(bin_path):
+        return None
+    orig_mode = None
+    try:
+        st = os.stat(bin_path)
+        if not os.access(bin_path, os.X_OK):
+            if not allow_chmod:
+                return None
+            orig_mode = stat.S_IMODE(st.st_mode)
+            os.chmod(bin_path, orig_mode | stat.S_IXUSR)
+        res = subprocess.run(
+            [bin_path, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if res.returncode == 0:
+            raw = (res.stdout or "").strip()
+            if _parse_semver(raw) is not None:
+                return raw
+    except Exception:
+        pass
+    finally:
+        if orig_mode is not None:
+            try:
+                os.chmod(bin_path, orig_mode)
+            except OSError:
+                pass
+    return None
+
+
+def _get_cached_orig_ver(backup_dir: str, orig_path: str, orig_sha: str, readonly: bool) -> str | None:
+    cache = _load_gemini_ver_cache(backup_dir)
+    entry = cache.get("orig")
+    if isinstance(entry, dict) and entry.get("sha256") == orig_sha and entry.get("version"):
+        return str(entry["version"])
+    if readonly:
+        return None
+    ver_str = _probe_agy_version_str(orig_path, allow_chmod=True)
+    if ver_str:
+        cache["orig"] = {"sha256": orig_sha, "version": ver_str}
+        _save_gemini_ver_cache(backup_dir, cache)
+    return ver_str
+
+
+def _get_cached_local_agy_ver(backup_dir: str, local_agy: str, readonly: bool) -> str | None:
+    if not os.path.isfile(local_agy):
+        return None
+    try:
+        st = os.stat(local_agy)
+    except OSError:
+        return None
+    sig = f"{st.st_size}:{getattr(st, 'st_mtime_ns', int(st.st_mtime))}"
+    cache = _load_gemini_ver_cache(backup_dir)
+    entry = cache.get("local")
+    if isinstance(entry, dict) and entry.get("stat") == sig and entry.get("version"):
+        return str(entry["version"])
+    ver_str = _probe_agy_version_str(local_agy, allow_chmod=False)
+    if ver_str and not readonly:
+        cache["local"] = {"stat": sig, "version": ver_str}
+        _save_gemini_ver_cache(backup_dir, cache)
+    return ver_str
+
+
+def _select_gemini_base_binary(
+    home_dir: str,
+    gemini_agy_orig: str,
+    orig_sha: str,
+    readonly: bool = False,
+) -> tuple[str, str | None, str | None, str | None]:
+    """
+    Selects the newest valid official base binary for Gemini.app/Contents/Helpers/agy:
+      - Upgrades to ~/.local/bin/agy ONLY when it exists, is executable, unpatched, and has strictly newer semver than orig.
+      - Never downgrades; falls back cleanly to ~/.antigravity-zh/backup/gemini_agy.orig when absent or older/equal.
+    Returns: (base_path, base_sha256_or_None, orig_ver_str, base_ver_str)
+    """
+    backup_dir = os.path.dirname(gemini_agy_orig)
+    orig_ver_str = _get_cached_orig_ver(backup_dir, gemini_agy_orig, orig_sha, readonly=readonly)
+    orig_ver = _parse_semver(orig_ver_str or "")
+
+    local_agy = os.path.join(home_dir, ".local", "bin", "agy")
+    local_ver_str = _get_cached_local_agy_ver(backup_dir, local_agy, readonly=readonly)
+    local_ver = _parse_semver(local_ver_str or "")
+
+    if (
+        local_ver is not None
+        and os.path.isfile(local_agy)
+        and os.access(local_agy, os.X_OK)
+        and (orig_ver is None or local_ver > orig_ver)
+    ):
+        try:
+            with open(local_agy, "rb") as f:
+                local_bytes = f.read()
+            if not _is_agy_already_patched_bytes(local_bytes):
+                return local_agy, hashlib.sha256(local_bytes).hexdigest(), orig_ver_str, local_ver_str
+        except Exception:
+            pass
+
+    if readonly and orig_ver_str is None:
+        return gemini_agy_orig, None, None, None
+    return gemini_agy_orig, orig_sha, orig_ver_str, orig_ver_str
+
+
 def _is_agy_already_patched_bytes(data: bytes) -> bool:
     return (
         SHARED_BUNDLE_REL_URL.encode("utf-8") in data
@@ -1256,9 +1394,9 @@ def ensure_and_patch_gemini_agy(home_dir: str, force: bool = False) -> bool:
     """
     Safely patches /Applications/Gemini.app/Contents/Helpers/agy:
       0. Verifies Gemini.app has passed macOS first-launch Gatekeeper check before touching it.
-      1. Stores the official original binary strictly out-of-bundle in ~/.antigravity-zh/backup/gemini_agy.orig.
-      2. Never replaces Helpers/agy with ~/.local/bin/agy; always patches strictly from Gemini.app's own binary.
-      3. Preserves original code-signing identifier (`agy`) and original entitlements (none) on single binary only.
+      1. Preserves Gemini.app's official built-in binary strictly out-of-bundle in ~/.antigravity-zh/backup/gemini_agy.orig.
+      2. Uses ~/.local/bin/agy as the patch base ONLY if it is strictly newer than gemini_agy.orig (never downgrades).
+      3. Preserves original code-signing identifier (`agy`) and entitlements on the single binary without touching MacOS/Gemini.
     """
     if not os.path.isfile(GEMINI_AGY_BIN):
         return False
@@ -1293,17 +1431,15 @@ def ensure_and_patch_gemini_agy(home_dir: str, force: bool = False) -> bool:
                 pass
 
     recorded_orig_sha = None
+    recorded_base_sha = None
     recorded_patched_sha = None
-    legacy_cross_base = False
     if os.path.isfile(gemini_agy_sha_file) and not os.path.islink(gemini_agy_sha_file):
         with open(gemini_agy_sha_file, "r", encoding="utf-8") as f:
             parts = f.read().strip().split(":")
             if len(parts) == 2:
-                recorded_orig_sha, recorded_patched_sha = parts[0], parts[1]
+                recorded_orig_sha, recorded_base_sha, recorded_patched_sha = parts[0], parts[0], parts[1]
             elif len(parts) >= 3:
                 recorded_orig_sha, recorded_base_sha, recorded_patched_sha = parts[0], parts[1], parts[2]
-                if recorded_base_sha != recorded_orig_sha:
-                    legacy_cross_base = True
 
     live_sha = compute_sha256(GEMINI_AGY_BIN)
 
@@ -1321,43 +1457,52 @@ def ensure_and_patch_gemini_agy(home_dir: str, force: bool = False) -> bool:
         return False
 
     orig_sha = compute_sha256(gemini_agy_orig)
+    base_path, base_sha, orig_ver_str, base_ver_str = _select_gemini_base_binary(
+        home_dir, gemini_agy_orig, orig_sha, readonly=False
+    )
     need_patch = (
         force
-        or legacy_cross_base
         or recorded_orig_sha != orig_sha
+        or recorded_base_sha != base_sha
         or recorded_patched_sha != live_sha
     )
     if not need_patch:
-        log("已校验 Gemini 内置 Antigravity 汉化内核就绪 -> Gemini.app/Contents/Helpers/agy")
+        ver_note = f"v{base_ver_str}" if base_ver_str else "已就绪"
+        log(f"已校验 Gemini 内置 Antigravity 汉化内核就绪 ({ver_note}) -> Gemini.app/Contents/Helpers/agy")
         return False
 
-    with open(gemini_agy_orig, "rb") as f:
-        orig_data = f.read()
+    with open(base_path, "rb") as f:
+        base_data = f.read()
 
-    patched_data, title_replaced = _patch_title_prompt_bytes(orig_data)
+    if base_path != gemini_agy_orig and base_ver_str and orig_ver_str:
+        log(f"检测到官方新版 agy CLI (v{base_ver_str} > 内置 v{orig_ver_str})，正在同步最新版底座并启用全部最新功能...")
+
+    patched_data, title_replaced = _patch_title_prompt_bytes(base_data)
     if not title_replaced:
         log("警告: 未在 Gemini Helpers/agy 中匹配到默认英文标题提示词")
 
     patched_data = patch_embedded_zip_in_binary(patched_data)
-    assert len(patched_data) == len(orig_data), "Gemini Helpers/agy 补丁前后字节长度必须严格相等"
+    assert len(patched_data) == len(base_data), "Gemini Helpers/agy 补丁前后字节长度必须严格相等"
 
-    orig_ident, orig_ent = _extract_codesign_metadata(gemini_agy_orig, "agy")
+    orig_ident, _ = _extract_codesign_metadata(gemini_agy_orig, "agy")
+    _, base_ent = _extract_codesign_metadata(base_path, orig_ident)
     staging_bin = os.path.join(GEMINI_HELPERS_DIR, f".agy.staging-{os.getpid()}")
     ent_tmp = os.path.join(backup_dir, f".agy_entitlements.{os.getpid()}.plist")
     try:
         if os.path.lexists(staging_bin):
             os.unlink(staging_bin)
         _write_exclusive_atomic(staging_bin, patched_data, 0o755)
-        _codesign_single_binary(staging_bin, orig_ident, orig_ent, ent_tmp)
+        _codesign_single_binary(staging_bin, orig_ident, base_ent, ent_tmp)
         _clear_quarantine_xattr(staging_bin, recursive=False)
         os.replace(staging_bin, GEMINI_AGY_BIN)
         patched_sha = compute_sha256(GEMINI_AGY_BIN)
         _write_exclusive_atomic(
             gemini_agy_sha_file,
-            f"{orig_sha}:{patched_sha}\n".encode("utf-8"),
+            f"{orig_sha}:{base_sha}:{patched_sha}\n".encode("utf-8"),
             0o600,
         )
-        log("已同步并汉化 Gemini 内置 Antigravity 核心二进制与中文标题引擎 -> Gemini.app/Contents/Helpers/agy")
+        ver_label = f" (v{base_ver_str})" if base_ver_str else ""
+        log(f"已同步并汉化 Gemini 内置 Antigravity 核心二进制{ver_label}与中文标题引擎 -> Gemini.app/Contents/Helpers/agy")
         return True
     except Exception as e:
         if os.path.lexists(staging_bin):
@@ -1531,12 +1676,17 @@ def _is_guard_up_to_date(home_dir: str) -> bool:
         try:
             with open(gemini_agy_sha_file, "r", encoding="utf-8") as f:
                 parts = f.read().strip().split(":")
-            if len(parts) != 2:
+            if len(parts) < 3:
                 return False
-            orig_sha, patched_sha = parts[0], parts[1]
-            if not orig_sha or not patched_sha:
+            orig_sha, base_sha, patched_sha = parts[0], parts[1], parts[2]
+            if not orig_sha or not base_sha or not patched_sha:
                 return False
-            if compute_sha256(GEMINI_AGY_BIN) != patched_sha or compute_sha256(gemini_agy_orig) != orig_sha:
+            if compute_sha256(gemini_agy_orig) != orig_sha or compute_sha256(GEMINI_AGY_BIN) != patched_sha:
+                return False
+            _, expected_base_sha, _, _ = _select_gemini_base_binary(
+                home_dir, gemini_agy_orig, orig_sha, readonly=True
+            )
+            if not expected_base_sha or expected_base_sha != base_sha:
                 return False
         except Exception:
             return False
@@ -1631,6 +1781,9 @@ def install_update_guard() -> None:
         persist_locales_dir,
         persist_engine_dir,
     ]
+    local_bin_dir = os.path.join(home_dir, ".local", "bin")
+    if os.path.isdir(local_bin_dir):
+        watch_paths.append(local_bin_dir)
 
     plist_data = {
         "Label": LAUNCH_AGENT_LABEL,

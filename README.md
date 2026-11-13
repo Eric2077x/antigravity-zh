@@ -7,13 +7,13 @@
 1. **双端完整汉化**
    - **Antigravity.app**：解包并修补 Electron `app.asar`，覆盖原生顶部菜单（含 `menu.js` 异步 WSL 菜单二次刷新）、原生右键菜单（`ipcHandlers.js` `buildContextMenuTemplate`）、托盘菜单、自动更新提示、加载与环境准备页、安全弹窗、USB/WebAuthn 设备选择、语言服务器诊断与工作区对话标题生成（`language_server_zh`）。
    - **Gemini.app 内置 Antigravity**：仅修补 `Gemini.app/Contents/Helpers/agy` 内嵌的前端资源，注入与 Antigravity 共用的静态汉化脚本 `/static/artifacts/.antigravity-zh/ag-zh.js`，支持 Agent 对话、设置面板、工作区、错误提示与右键/浮层全量动态汉化。
-2. **原生签名与包体洁净保护**
-   - **绝不跨版本替换二进制**：始终基于本机 `Gemini.app/Contents/Helpers/agy` 原版二进制进行原地等长内嵌 ZIP 重打包，绝不用 `~/.local/bin/agy` 等外部 CLI 覆盖 `Helpers/agy`。
-   - **包外备份**：原版备份与状态校验统一保存在 `~/.antigravity-zh/backup/`，不在 `Gemini.app/Contents/Helpers/` 内残留 `.agy.orig` 等多余文件，绝不重签 `Gemini.app` 外层或 `MacOS/Gemini`。
-   - **精准单文件重签**：对 `language_server_zh` 保留原始 `allow-jit` 权限；对 `Helpers/agy` 保留原始 `Identifier=agy` 且不额外注入非必要权限；首次启动前若检测到 macOS Gatekeeper 尚未放行，会自动等待用户首次打开放行后再安全打补丁，避免破坏初次校验。
+2. **版本择优同步与包体洁净保护**
+   - **只升不降的官方底座策略**：始终优先识别并保留本机 `Gemini.app/Contents/Helpers/agy` 原版备份；当检测到本机存在更高版本的官方 `~/.local/bin/agy` CLI（支持最新 `2.31+` 内核与 `/swarm`）时，自动以其为底座执行等长内嵌 ZIP 重打包，无更高版本或外部 CLI 缺失时平滑回退原版，只升级不降级。
+   - **包外备份**：官方原版备份与多段 SHA256 状态统一保存在 `~/.antigravity-zh/backup/`，不在 `Gemini.app/Contents/Helpers/` 内残留 `.agy.orig` 等多余文件，绝不修改 `MacOS/Gemini`。
+   - **精准单文件重签**：对 `language_server_zh` 保留原始 `allow-jit` 权限；对 `Helpers/agy` 保留原始 `Identifier=agy` 且不额外注入非必要权限；首次启动前若检测到 macOS Gatekeeper 尚未放行，会自动等待用户首次打开放行后再安全打补丁。
 3. **防更新掉落与双向同步守护**
-   - 自动安装 `~/.antigravity-zh/guard-runner.sh` 与用户级 LaunchAgent（`~/Library/LaunchAgents/com.antigravity.zh-cn.plist`），监听 `/Applications`、`~/.antigravity-zh/locales`、`~/.antigravity-zh/engine` 并配合 60 秒轻量巡检。
-   - **无自引用死锁**：LaunchAgent 直接通过独立脚本调用真实 `python3` 运行 `--guard`，不依赖应用自身 `Antigravity Helper`。
+   - 自动安装 `~/.antigravity-zh/guard-runner.sh` 与用户级 LaunchAgent（`~/Library/LaunchAgents/com.antigravity.zh-cn.plist`），监听 `/Applications`、`~/.antigravity-zh/locales`、`~/.antigravity-zh/engine`（及存在时的 `~/.local/bin`）并配合 60 秒轻量巡检。
+   - **TCC 无弹窗只读预检**：守护脚本先通过 `patcher.py --guard-check` 进行只读校验（最新则零开销退出）；仅在真正检测到更新或词库变化时，才通过 `Antigravity Helper` (`ELECTRON_RUN_AS_NODE=1`) 调起 `--guard` 完成无痛同步，避免 `launchd` 被 macOS App 管理拦截。
    - **进程锁与防自杀**：进程互斥锁统一位于 `/tmp/antigravity-zh-{uid}.lock`（带 `O_NOFOLLOW` 与属主校验）；在 Antigravity / Gemini 内置终端运行时自动跳过自杀，提示按 `Cmd + R` 或手动重启生效。
 4. **纯增量补丁与无损还原**
    - 不上传、不分发官方闭源二进制；支持 `locales/zh-CN.json` 词库与 `engine/dom-translator.js` 引擎持续演进。
