@@ -4029,7 +4029,15 @@
     "Press": "按",
     "automation.": "自动化任务。",
     "later.": "（稍后）。",
-    "From": "来源"
+    "From": "来源",
+    "Failed to process image": "处理图片失败",
+    "Failed to attach file": "添加附件失败",
+    "Maximum number of attachments reached": "已达附件数量上限",
+    "PDF file size exceeds 10MB limit": "PDF 文件大小超过 10MB 限制",
+    "Document file size exceeds 10MB limit": "文档大小超过 10MB 限制",
+    "Zip file size exceeds 20MB limit": "压缩包大小超过 20MB 限制",
+    "Text file size exceeds 1MB limit": "文本文件大小超过 1MB 限制",
+    "File size exceeds 20MB limit": "文件大小超过 20MB 限制"
   },
   "fragments": [
     [

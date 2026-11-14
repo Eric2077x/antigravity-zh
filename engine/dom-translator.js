@@ -1451,6 +1451,77 @@
     } catch (_) {}
   }
 
+  /**
+   * 兼容 Gemini.app (WKWebView)：Apple CoreGraphics JPEG 编码器面对终端截图等高频对比度文字，
+   * 在 quality=0.01 时仍常大于前端 10KB 缩略图上限 (13653 chars)，导致整张图被误拒。
+   * 仅对非 Chromium 的 WebKit 引擎在缩略图极限压缩仍超限时，按递减边长重采样使其安全通过；
+   * 主图 (1024px / 1MB) 从不触发此极低质量分支，画质完全保留。
+   */
+  function installWebKitThumbCompressionFallback() {
+    try {
+      const ua = typeof navigator !== 'undefined' && navigator.userAgent ? navigator.userAgent : '';
+      if (!ua || /Chrome|Chromium|Electron|Firefox/i.test(ua)) return;
+      const proto = typeof HTMLCanvasElement !== 'undefined' ? HTMLCanvasElement.prototype : null;
+      if (!proto || typeof proto.toDataURL !== 'function' || proto.__agZhThumbPatched) return;
+
+      const origToDataURL = proto.toDataURL;
+      const MAX_THUMB_DATAURL_LEN = 13653;
+      const THUMB_FALLBACK_EDGES = [240, 200, 160, 128, 96, 64];
+
+      proto.toDataURL = function (type, quality) {
+        const res = origToDataURL.apply(this, arguments);
+        try {
+          if (
+            typeof type !== 'string' ||
+            type.toLowerCase() !== 'image/jpeg' ||
+            typeof quality !== 'number' ||
+            quality > 0.03 ||
+            res.length <= MAX_THUMB_DATAURL_LEN
+          ) {
+            return res;
+          }
+          const w = this.width | 0;
+          const h = this.height | 0;
+          const maxDim = Math.max(w, h);
+          if (w <= 0 || h <= 0 || maxDim > 320) {
+            return res;
+          }
+
+          let best = res;
+          for (let i = 0; i < THUMB_FALLBACK_EDGES.length; i++) {
+            const edge = THUMB_FALLBACK_EDGES[i];
+            if (edge >= maxDim) continue;
+            const tw = Math.max(1, Math.round((w * edge) / maxDim));
+            const th = Math.max(1, Math.round((h * edge) / maxDim));
+            const tmp = document.createElement('canvas');
+            tmp.width = tw;
+            tmp.height = th;
+            const ctx = tmp.getContext('2d');
+            if (!ctx) continue;
+            ctx.imageSmoothingEnabled = true;
+            ctx.imageSmoothingQuality = 'high';
+            ctx.drawImage(this, 0, 0, tw, th);
+            const candidate = origToDataURL.call(tmp, 'image/jpeg', quality);
+            best = candidate;
+            if (candidate.length <= MAX_THUMB_DATAURL_LEN) {
+              return candidate;
+            }
+          }
+          return best;
+        } catch (_) {
+          return res;
+        }
+      };
+      Object.defineProperty(proto, '__agZhThumbPatched', {
+        value: true,
+        configurable: false,
+        enumerable: false,
+      });
+    } catch (_) {}
+  }
+
+  installWebKitThumbCompressionFallback();
+
   if (document.readyState === 'loading') {
     window.addEventListener('DOMContentLoaded', startEngine, { once: true });
   } else {
