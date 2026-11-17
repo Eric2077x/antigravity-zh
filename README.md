@@ -34,9 +34,28 @@ antigravity-zh/
 
 ## 使用方法
 
-### 1. 安装 / 更新汉化
+### 1. 一键安装 / 更新（推荐）
+
+**方式一：直接发给 AI 智能体自动安装**（适用于 Antigravity / Gemini 内置智能体，或 Claude Code / Cursor / Codex 等任意编程智能体，整段复制发送即可）：
+
+```text
+请帮我从 https://github.com/Eric2077x/antigravity-zh 一键下载并安装最新版 macOS 双端汉化包，直接在单个终端会话中执行以下命令：
+
+(TMP_DIR="$(mktemp -d)" && trap 'rm -rf "$TMP_DIR"' EXIT && PY="" && for p in /opt/homebrew/bin/python3 /usr/local/bin/python3 /Library/Frameworks/Python.framework/Versions/Current/bin/python3; do [ -x "$p" ] && PY="$p" && break; done && { [ -n "$PY" ] || { xcode-select -p >/dev/null 2>&1 && [ -x /usr/bin/python3 ] && PY=/usr/bin/python3; }; } && if [ -z "$PY" ]; then echo "未检测到可用的 Python 3，请先执行 xcode-select --install 后再试。" >&2; exit 1; fi && curl -fsSL https://github.com/Eric2077x/antigravity-zh/archive/refs/heads/main.tar.gz -o "$TMP_DIR/pkg.tar.gz" && tar -xzf "$TMP_DIR/pkg.tar.gz" -C "$TMP_DIR" && if ! ("$PY" "$TMP_DIR/antigravity-zh-main/patcher.py" && "$PY" "$HOME/.antigravity-zh/patcher.py" --guard-check); then echo "提示：若遇到 macOS「App 管理」权限拦截，请在系统弹窗点“允许”，或在终端执行一次: sudo $PY \"$HOME/.antigravity-zh/patcher.py\"" >&2; exit 1; fi)
+
+执行后若返回码为 0：如果当前在 Antigravity 或 Gemini 内部对话，请提醒我按一下 Cmd + R（或重启一次应用）使中文完整生效；若返回非 0，请把终端输出的提示或 sudo 命令原样发给我。
+```
+
+**方式二：在 macOS 终端直接一键运行**（免 `git` 依赖，安装后自动清理临时文件并注册防更新掉落守护）：
 
 ```bash
+(TMP_DIR="$(mktemp -d)" && trap 'rm -rf "$TMP_DIR"' EXIT && PY="" && for p in /opt/homebrew/bin/python3 /usr/local/bin/python3 /Library/Frameworks/Python.framework/Versions/Current/bin/python3; do [ -x "$p" ] && PY="$p" && break; done && { [ -n "$PY" ] || { xcode-select -p >/dev/null 2>&1 && [ -x /usr/bin/python3 ] && PY=/usr/bin/python3; }; } && if [ -z "$PY" ]; then echo "未检测到可用的 Python 3，请先执行 xcode-select --install 后再试。" >&2; exit 1; fi && curl -fsSL https://github.com/Eric2077x/antigravity-zh/archive/refs/heads/main.tar.gz -o "$TMP_DIR/pkg.tar.gz" && tar -xzf "$TMP_DIR/pkg.tar.gz" -C "$TMP_DIR" && if ! ("$PY" "$TMP_DIR/antigravity-zh-main/patcher.py" && "$PY" "$HOME/.antigravity-zh/patcher.py" --guard-check); then echo "提示：若遇到 macOS「App 管理」权限拦截，请在系统弹窗点“允许”，或在终端执行一次: sudo $PY \"$HOME/.antigravity-zh/patcher.py\"" >&2; exit 1; fi)
+```
+
+### 2. 本地克隆安装与常用参数
+
+```bash
+git clone https://github.com/Eric2077x/antigravity-zh.git
 cd antigravity-zh
 python3 patcher.py
 ```
@@ -44,7 +63,7 @@ python3 patcher.py
 若系统提示 macOS「App 管理」拦截了对 `/Applications/` 的修改，可在「系统设置 -> 隐私与安全性 -> App 管理」中授权当前终端，或使用管理员权限运行（脚本会自动归还用户目录文件属主）：
 
 ```bash
-sudo python3 patcher.py
+sudo python3 ~/.antigravity-zh/patcher.py
 ```
 
 常用参数：
@@ -55,13 +74,13 @@ sudo python3 patcher.py
 - `--guard`：守护巡检模式（仅当版本更新、Gatekeeper 放行或词库变化时增量同步）。
 - `--guard-check`：只读快速检查双端与共享汉化包是否为最新状态（最新返回 `0`，需同步返回 `1`）。
 
-### 2. 一键无损还原
+### 3. 一键无损还原
 
 ```bash
-python3 restore.py
+python3 ~/.antigravity-zh/restore.py
 ```
 
-若应用目录受系统权限保护，同样可使用 `sudo python3 restore.py`。还原脚本会依次卸载并移除 LaunchAgent、从备份还原 `app.asar` 与 `Gemini.app/Contents/Helpers/agy`、删除 `language_server_zh`、清理共享 Web 汉化目录 `~/.gemini/{antigravity,antigravity-cli}/brain/.antigravity-zh` 与 `~/.antigravity-zh/`。
+若应用目录受系统权限保护，同样可使用 `sudo python3 ~/.antigravity-zh/restore.py`。还原脚本会依次卸载并移除 LaunchAgent、从备份还原 `app.asar` 与 `Gemini.app/Contents/Helpers/agy`、删除 `language_server_zh`、清理共享 Web 汉化目录 `~/.gemini/{antigravity,antigravity-cli}/brain/.antigravity-zh` 与 `~/.antigravity-zh/`。
 
 ## 开源协议
 
