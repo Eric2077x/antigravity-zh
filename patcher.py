@@ -263,10 +263,33 @@ def _merge_tree(src_dir: str, dst_dir: str) -> None:
                 shutil.copy2(src_f, dst_f)
 
 
-def _write_exclusive_atomic(target_path: str, data: bytes, mode: int) -> None:
-    """Writes data to target_path atomically via an exclusive staging file + fsync + os.replace."""
+GUARD_STAT_CACHE_NAME = "guard_stat_cache.json"
+
+
+def _safe_js_json_dumps(obj: object, compact: bool = True) -> str:
+    """将对象序列化为可安全内联到 JS 脚本中的 JSON 字符串，转义 HTML 与行分隔符。"""
+    if compact:
+        raw = json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+    else:
+        raw = json.dumps(obj, ensure_ascii=False)
+    return (
+        raw.replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("&", "\\u0026")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
+
+
+def _write_exclusive_atomic(
+    target_path: str, data: bytes, mode: int, dir_mode: int = 0o755
+) -> None:
+    """通过排他临时文件、fsync 与原子替换安全写入目标路径，拒绝覆盖软链接。"""
+    if os.path.islink(target_path):
+        raise PermissionError(f"安全拦截：拒绝覆盖符号链接目标 {target_path}")
     parent_dir = os.path.dirname(target_path)
-    os.makedirs(parent_dir, mode=0o700, exist_ok=True)
+    if parent_dir:
+        os.makedirs(parent_dir, mode=dir_mode, exist_ok=True)
     tmp_path = f"{target_path}.tmp-{os.getpid()}-{int(time.time() * 1000)}"
     flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
     if hasattr(os, "O_NOFOLLOW"):
@@ -283,6 +306,74 @@ def _write_exclusive_atomic(target_path: str, data: bytes, mode: int) -> None:
         if os.path.lexists(tmp_path):
             os.unlink(tmp_path)
         raise
+
+
+def _load_guard_stat_cache(home_dir: str) -> dict:
+    """只读加载守护巡检的 stat 签名缓存，校验非软链接且为普通文件。"""
+    cache_path = os.path.join(home_dir, ".antigravity-zh", "backup", GUARD_STAT_CACHE_NAME)
+    try:
+        st = os.lstat(cache_path)
+        if not stat.S_ISREG(st.st_mode):
+            return {}
+        with open(cache_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_guard_stat_cache(home_dir: str, cache: dict) -> None:
+    """原子保存守护巡检的 stat 签名缓存（权限 0600，目录 0700）。"""
+    cache_path = os.path.join(home_dir, ".antigravity-zh", "backup", GUARD_STAT_CACHE_NAME)
+    try:
+        payload = json.dumps(cache, ensure_ascii=False, indent=2).encode("utf-8")
+        _write_exclusive_atomic(cache_path, payload, 0o600, dir_mode=0o700)
+    except Exception:
+        pass
+
+
+def _file_stat_sig(st: os.stat_result) -> str:
+    """生成用于校验文件未变化的轻量 stat 指纹。"""
+    return f"{st.st_size}:{getattr(st, 'st_mtime_ns', int(st.st_mtime))}:{st.st_ino}"
+
+
+def _record_stat_cache(cache: dict, filepath: str, sha: str) -> None:
+    """记录单个普通文件的最新 stat 指纹与 SHA256。"""
+    try:
+        st = os.lstat(filepath)
+        if stat.S_ISREG(st.st_mode) and sha:
+            cache[filepath] = {"sig": _file_stat_sig(st), "sha256": sha}
+    except OSError:
+        pass
+
+
+def _fast_sha256_for_guard(filepath: str, cache: dict, state: dict) -> str:
+    """守护检查快速路径：stat 未变直接复用缓存 SHA256，未命中再真实计算并标记脏缓存。"""
+    try:
+        st = os.lstat(filepath)
+    except OSError:
+        return ""
+    if not stat.S_ISREG(st.st_mode):
+        return ""
+    sig = _file_stat_sig(st)
+    entry = cache.get(filepath)
+    if isinstance(entry, dict) and entry.get("sig") == sig and entry.get("sha256"):
+        return str(entry["sha256"])
+    sha = compute_sha256(filepath)
+    cache[filepath] = {"sig": sig, "sha256": sha}
+    state["dirty"] = True
+    return sha
+
+
+def _parse_ls_sha_state(raw: str) -> tuple[str, str]:
+    """解析 .zh_ls_sha256 状态行（兼容旧版纯 SHA256 与新版 `<sha>:<status>`）。"""
+    text = (raw or "").strip()
+    if not text:
+        return "", ""
+    if ":" in text:
+        sha, status = text.split(":", 1)
+        return sha.strip(), (status.strip() or "patched")
+    return text, "patched"
 
 
 def verify_asar_complete(asar_path: str) -> bool:
@@ -421,7 +512,7 @@ def patch_preload(dist_dir: str, locale_data: dict, engine_code: str) -> None:
         "exact": locale_data.get("exact", {}),
         "fragments": locale_data.get("fragments", []),
     }
-    locale_json_str = json.dumps(frontend_locale, ensure_ascii=False, separators=(",", ":"))
+    locale_json_str = _safe_js_json_dumps(frontend_locale, compact=True)
 
     injection = (
         f"{PATCH_START_MARKER}\n"
@@ -494,7 +585,7 @@ def patch_menu(dist_dir: str, menu_dict: dict) -> None:
         "const submenuItem = appMenu.items.find((item) => item.label === submenuLabel || (submenuLabel === 'File' && item.label === '文件') || (submenuLabel === 'Help' && item.label === '帮助') || (submenuLabel === 'View' && item.label === '视图'));",
     )
 
-    menu_json = json.dumps(merged_menu, ensure_ascii=False)
+    menu_json = _safe_js_json_dumps(merged_menu, compact=False)
     role_map = {
         "about": "关于 Antigravity",
         "services": "服务",
@@ -528,7 +619,7 @@ def patch_menu(dist_dir: str, menu_dict: dict) -> None:
         "viewmenu": "视图",
         "windowmenu": "窗口",
     }
-    role_json = json.dumps(role_map, ensure_ascii=False)
+    role_json = _safe_js_json_dumps(role_map, compact=False)
 
     helper_block = (
         f"{PATCH_START_MARKER}\n"
@@ -600,6 +691,14 @@ def patch_main(dist_dir: str) -> None:
         ("message: `The WSL distro \"${WSL_DISTRO}\" is no longer installed.`", "message: `WSL 发行版“${WSL_DISTRO}”已不再安装。`"),
         ("detail: 'Antigravity opened on Windows instead.'", "detail: '已改为在 Windows 上打开 Antigravity。'"),
         ("showErrorBox('WSL setup failed'", "showErrorBox('WSL 配置失败'"),
+        (
+            "const msg = `language_server binary not found at:\\n${languageServer_1.LS_BINARY}\\n\\nPlease build set a valid location.`;",
+            "const msg = `未在以下路径找到 language_server 二进制文件：\\n${languageServer_1.LS_BINARY}\\n\\n请检查安装并配置有效路径。`;",
+        ),
+        (
+            "const msg = `Failed to install the server into WSL distro \"${WSL_DISTRO}\":\\n${err.message}`;",
+            "const msg = `将服务端安装到 WSL 发行版“${WSL_DISTRO}”失败：\\n${err.message}`;",
+        ),
         ("buttons: ['Cancel', 'Quit']", "buttons: ['取消', '退出']"),
         ("title: 'Confirm Quit'", "title: '确认退出'"),
         ("message: 'Are you sure you want to quit?'", "message: '确定要退出 Antigravity 吗？'"),
@@ -635,24 +734,47 @@ def patch_ipc_handlers(dist_dir: str, locale_data: dict) -> None:
     if isinstance(menu_dict, dict):
         context_map.update(menu_dict)
     context_map.update(FALLBACK_MENU_MAP)
-    context_json = json.dumps(context_map, ensure_ascii=False, separators=(",", ":"))
+    context_json = _safe_js_json_dumps(context_map, compact=True)
 
     helper_block = (
         f"{PATCH_START_MARKER}\n"
-        f"const __agZhContextMap = {context_json};\n"
+        f"const __agZhContextMap = Object.assign(Object.create(null), {context_json});\n"
+        "function __agZhLookupContext(key) {\n"
+        "    return Object.prototype.hasOwnProperty.call(__agZhContextMap, key) ? __agZhContextMap[key] : null;\n"
+        "}\n"
+        "function __agZhTranslateContextDynamic(trimmed) {\n"
+        "    let m;\n"
+        "    if ((m = trimmed.match(/^Move\\s+to\\s+Group:\\s*(.+)$/i))) return `移至分组：${m[1]}`;\n"
+        "    if ((m = trimmed.match(/^Open\\s+in\\s+(.+)$/i)) && m[1].length <= 60 && !/[.!?]$/.test(m[1]) && !/^(?:the|a|an)\\s+/i.test(m[1])) {\n"
+        "        return `在 ${__agZhLookupContext(m[1]) || m[1]} 中打开`;\n"
+        "    }\n"
+        "    if ((m = trimmed.match(/^Remove\\s+(.+?)\\s+from\\s+Recent$/i))) return `从最近列表中移除 ${m[1]}`;\n"
+        "    if ((m = trimmed.match(/^Search\\s+Google\\s+for\\s+[\"“'](.+?)[\"”']$/i))) return `在 Google 中搜索“${m[1]}”`;\n"
+        "    if ((m = trimmed.match(/^Worktree\\s+from\\s+(.+)$/i))) return `从 ${m[1]} 创建工作树`;\n"
+        "    if ((m = trimmed.match(/^Work\\s+locally\\s+on\\s+(.+)$/i))) return `在本地处理 ${m[1]}`;\n"
+        "    if ((m = trimmed.match(/^(Hide|Show)\\s+(.+?)\\s+(?:from\\s+this\\s+list|in\\s+the\\s+list\\s+again)$/i))) {\n"
+        "        return m[1].toLowerCase() === 'hide' ? `从列表中隐藏 ${m[2]}` : `在列表中重新显示 ${m[2]}`;\n"
+        "    }\n"
+        "    if ((m = trimmed.match(/^Mark\\s+all\\s+(\\d+)\\s+conversations?\\s+as\\s+read$/i))) return `将全部 ${m[1]} 个对话标为已读`;\n"
+        "    return null;\n"
+        "}\n"
         "function __agZhTranslateContextLabel(rawLabel) {\n"
         "    if (typeof rawLabel !== 'string' || !rawLabel) return '';\n"
-        "    if (Object.prototype.hasOwnProperty.call(__agZhContextMap, rawLabel)) return __agZhContextMap[rawLabel];\n"
+        "    const direct = __agZhLookupContext(rawLabel);\n"
+        "    if (direct !== null) return direct;\n"
         "    const trimmed = rawLabel.trim();\n"
-        "    if (Object.prototype.hasOwnProperty.call(__agZhContextMap, trimmed)) return __agZhContextMap[trimmed];\n"
+        "    const byTrimmed = __agZhLookupContext(trimmed);\n"
+        "    if (byTrimmed !== null) return byTrimmed;\n"
         "    if (trimmed.endsWith('...')) {\n"
-        "        const base = trimmed.slice(0, -3);\n"
-        "        if (Object.prototype.hasOwnProperty.call(__agZhContextMap, base)) return __agZhContextMap[base] + '…';\n"
+        "        const byBase = __agZhLookupContext(trimmed.slice(0, -3));\n"
+        "        if (byBase !== null) return byBase + '…';\n"
         "    }\n"
         "    if (trimmed.endsWith('…')) {\n"
-        "        const base = trimmed.slice(0, -1);\n"
-        "        if (Object.prototype.hasOwnProperty.call(__agZhContextMap, base)) return __agZhContextMap[base] + '…';\n"
+        "        const byBase = __agZhLookupContext(trimmed.slice(0, -1));\n"
+        "        if (byBase !== null) return byBase + '…';\n"
         "    }\n"
+        "    const dyn = __agZhTranslateContextDynamic(trimmed);\n"
+        "    if (dyn !== null) return dyn;\n"
         "    return rawLabel;\n"
         "}\n"
         f"{PATCH_END_MARKER}\n"
@@ -771,6 +893,7 @@ def patch_webauthn_and_cable(dist_dir: str) -> None:
             ("title: 'Choose a Passkey'", "title: '选择通行密钥'"),
             ("message: `Sign in to ${rpLabel}`", "message: `登录到 ${rpLabel}`"),
             ("detail: 'Select a passkey account to continue:'", "detail: '请选择一个通行密钥账号以继续：'"),
+            ("return `Account ${index + 1}`;", "return `账号 ${index + 1}`;"),
             (", 'Cancel']", ", '取消']"),
         ],
         "已汉化通行密钥选择弹窗 -> dist/webauthn.js",
@@ -808,6 +931,33 @@ def patch_wizard_html(dist_dir: str) -> None:
         (">Explore the new Antigravity</button>", ">探索全新 Antigravity</button>"),
     ]
     _apply_replacements(wizard_path, replacements, "已汉化首次安装向导页 -> dist/ideInstall/wizardHtml.js")
+
+
+def patch_wsl(dist_dir: str) -> None:
+    wsl_path = os.path.join(dist_dir, "wsl.js")
+    replacements = [
+        (
+            "error: `This folder belongs to the WSL distro \"${unc[1]}\", but this window is connected to \"${distro}\".`,",
+            "error: `此文件夹属于 WSL 发行版“${unc[1]}”，但当前窗口连接到的是“${distro}”。`,",
+        ),
+        (
+            "warning: 'This folder is on the Windows filesystem. Accessing it from WSL (via /mnt) can be slow — for best performance keep projects inside the WSL filesystem.',",
+            "warning: '此文件夹位于 Windows 文件系统中，从 WSL（通过 /mnt）访问可能较慢——建议将项目存放在 WSL 文件系统内以获得最佳性能。',",
+        ),
+        (
+            "return { error: `This location cannot be opened in WSL: ${winPath}` };",
+            "return { error: `无法在 WSL 中打开此位置：${winPath}` };",
+        ),
+        (
+            "onStatus?.('Downloading the Antigravity binary\\u2026');",
+            "onStatus?.('正在下载 Antigravity 二进制文件…');",
+        ),
+        (
+            "onStatus?.(`Installing into ${distro}\\u2026`);",
+            "onStatus?.(`正在安装到 ${distro}…`);",
+        ),
+    ]
+    _apply_replacements(wsl_path, replacements, "已汉化 WSL 路径与安装状态提示 -> dist/wsl.js")
 
 
 def patch_language_server_js(dist_dir: str) -> None:
@@ -868,7 +1018,7 @@ def _codesign_single_binary(target_bin: str, ident: str, ent_xml: bytes | None, 
     cmd = ["/usr/bin/codesign", "-f", "-s", "-", "-i", ident]
     try:
         if ent_xml:
-            _write_exclusive_atomic(ent_tmp_path, ent_xml, 0o600)
+            _write_exclusive_atomic(ent_tmp_path, ent_xml, 0o600, dir_mode=0o700)
             cmd.extend(["--entitlements", ent_tmp_path])
         cmd.append(target_bin)
         subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -897,7 +1047,7 @@ def _patch_title_prompt_bytes(data: bytes) -> tuple[bytes, bool]:
     return data, replaced
 
 
-def ensure_and_patch_language_server_bin(force: bool = False) -> None:
+def ensure_and_patch_language_server_bin(force: bool = False, home_dir: str | None = None) -> None:
     """
     Creates Resources/bin/language_server_zh from Resources/bin/language_server
     with the title generator prompt replaced by Simplified Chinese instructions,
@@ -908,15 +1058,20 @@ def ensure_and_patch_language_server_bin(force: bool = False) -> None:
         return
 
     current_ls_sha = compute_sha256(LS_ORIG_BIN)
-    recorded_ls_sha = None
+    if home_dir:
+        stat_cache = _load_guard_stat_cache(home_dir)
+        _record_stat_cache(stat_cache, LS_ORIG_BIN, current_ls_sha)
+        _save_guard_stat_cache(home_dir, stat_cache)
+
+    recorded_ls_sha, recorded_ls_status = "", ""
     if os.path.isfile(LS_SHA256_STATE_FILE):
         with open(LS_SHA256_STATE_FILE, "r", encoding="utf-8") as f:
-            recorded_ls_sha = f.read().strip()
+            recorded_ls_sha, recorded_ls_status = _parse_ls_sha_state(f.read())
 
     need_patch = (
         force
-        or (not os.path.isfile(LS_ZH_BIN) and recorded_ls_sha != current_ls_sha)
         or recorded_ls_sha != current_ls_sha
+        or (recorded_ls_status == "patched" and not os.path.isfile(LS_ZH_BIN))
     )
     if not need_patch:
         log("已校验原生中文对话标题引擎就绪 -> Resources/bin/language_server_zh")
@@ -927,7 +1082,9 @@ def ensure_and_patch_language_server_bin(force: bool = False) -> None:
 
     patched_data, replaced = _patch_title_prompt_bytes(data)
     if not replaced:
-        _write_exclusive_atomic(LS_SHA256_STATE_FILE, (current_ls_sha + "\n").encode("utf-8"), 0o644)
+        _write_exclusive_atomic(
+            LS_SHA256_STATE_FILE, f"{current_ls_sha}:unmatched\n".encode("utf-8"), 0o644
+        )
         log("警告: 未在 language_server 中匹配到默认英文标题提示词，已记录状态跳过二进制替换")
         return
 
@@ -940,7 +1097,9 @@ def ensure_and_patch_language_server_bin(force: bool = False) -> None:
         _codesign_single_binary(LS_ZH_STAGING_BIN, orig_ident, orig_ent, ent_plist)
         _clear_quarantine_xattr(LS_ZH_STAGING_BIN, recursive=False)
         os.replace(LS_ZH_STAGING_BIN, LS_ZH_BIN)
-        _write_exclusive_atomic(LS_SHA256_STATE_FILE, (current_ls_sha + "\n").encode("utf-8"), 0o644)
+        _write_exclusive_atomic(
+            LS_SHA256_STATE_FILE, f"{current_ls_sha}:patched\n".encode("utf-8"), 0o644
+        )
         log("已生成原生中文对话标题引擎 -> Resources/bin/language_server_zh")
     except Exception as e:
         if os.path.lexists(LS_ZH_STAGING_BIN):
@@ -950,39 +1109,44 @@ def ensure_and_patch_language_server_bin(force: bool = False) -> None:
 
 def write_shared_web_bundle(locale_data: dict, engine_code: str, home_dir: str) -> str:
     """
-    Atomically writes the shared frontend localization bundle to
-    ~/.gemini/antigravity/brain/.antigravity-zh/ag-zh.js and cleans up the legacy bare file,
-    so any running Gemini.app agy --hub serves /static/artifacts/.antigravity-zh/ag-zh.js.
+    Atomically writes the shared frontend localization bundle to both
+    ~/.gemini/antigravity/brain/.antigravity-zh/ag-zh.js (used by Gemini.app with --app_data_dir=antigravity)
+    and ~/.gemini/antigravity-cli/brain/.antigravity-zh/ag-zh.js (used by standalone `agy --hub` without --app_data_dir),
+    and cleans up the legacy bare file.
     """
-    brain_root = os.path.join(home_dir, ".gemini", "antigravity", "brain")
-    bundle_dir = os.path.join(brain_root, ".antigravity-zh")
-    os.makedirs(bundle_dir, mode=0o755, exist_ok=True)
-    bundle_path = os.path.join(bundle_dir, "ag-zh.js")
-
     frontend_locale = {
         "version": locale_data.get("version", "2.31.2"),
         "exact": locale_data.get("exact", {}),
         "fragments": locale_data.get("fragments", []),
     }
-    locale_json_str = json.dumps(frontend_locale, ensure_ascii=False, separators=(",", ":"))
+    locale_json_str = _safe_js_json_dumps(frontend_locale, compact=True)
     bundle_content = (
         f"{PATCH_START_MARKER}\n"
         f"const __AG_ZH_LOCALE__ = {locale_json_str};\n"
         f"{engine_code.rstrip()}\n"
         f"{PATCH_END_MARKER}\n"
     ).encode("utf-8")
-    _write_exclusive_atomic(bundle_path, bundle_content, 0o644)
 
-    for legacy_name in ("ag-zh-bundle.js", ".ag-zh-bundle.js.staging"):
-        legacy_path = os.path.join(brain_root, legacy_name)
-        if os.path.lexists(legacy_path):
-            try:
-                os.unlink(legacy_path)
-            except OSError:
-                pass
+    primary_bundle_path = ""
+    for app_data_name in ("antigravity", "antigravity-cli"):
+        brain_root = os.path.join(home_dir, ".gemini", app_data_name, "brain")
+        bundle_dir = os.path.join(brain_root, ".antigravity-zh")
+        os.makedirs(bundle_dir, mode=0o755, exist_ok=True)
+        bundle_path = os.path.join(bundle_dir, "ag-zh.js")
+        _write_exclusive_atomic(bundle_path, bundle_content, 0o644, dir_mode=0o755)
+        if not primary_bundle_path:
+            primary_bundle_path = bundle_path
 
-    log(f"已同步生成共享前端汉化包 -> {bundle_path} (词条数: {len(frontend_locale['exact'])})")
-    return bundle_path
+        for legacy_name in ("ag-zh-bundle.js", ".ag-zh-bundle.js.staging"):
+            legacy_path = os.path.join(brain_root, legacy_name)
+            if os.path.lexists(legacy_path):
+                try:
+                    os.unlink(legacy_path)
+                except OSError:
+                    pass
+
+    log(f"已同步生成共享前端汉化包 -> {primary_bundle_path} 及 antigravity-cli (词条数: {len(frontend_locale['exact'])})")
+    return primary_bundle_path
 
 
 def _minify_index_html_safely(raw_html: bytes) -> bytes:
@@ -1042,9 +1206,10 @@ def _rebuild_embedded_zip(orig_zip_bytes: bytes, recompress_css: bool = False) -
         if info.filename == "index.html":
             raw_html = zin.read("index.html")
             if SHARED_BUNDLE_REL_URL.encode("utf-8") in raw_html:
-                new_html = raw_html
+                new_html = raw_html.replace(b'<html lang="en">', b'<html lang="zh-CN">', 1)
             else:
                 cleaned_html = _minify_index_html_safely(raw_html)
+                cleaned_html = cleaned_html.replace(b'<html lang="en">', b'<html lang="zh-CN">', 1)
                 if b"</script>" not in cleaned_html:
                     raise ValueError("index.html 中未找到 </script> 标签")
                 new_html = cleaned_html.replace(b"</script>", NEW_INDEX_HTML_LOADER + b"\n    </script>", 1)
@@ -1271,7 +1436,12 @@ def _load_gemini_ver_cache(backup_dir: str) -> dict:
 def _save_gemini_ver_cache(backup_dir: str, cache: dict) -> None:
     ver_file = os.path.join(backup_dir, "gemini_agy.ver")
     try:
-        _write_exclusive_atomic(ver_file, json.dumps(cache, ensure_ascii=False, indent=2).encode("utf-8"), 0o600)
+        _write_exclusive_atomic(
+            ver_file,
+            json.dumps(cache, ensure_ascii=False, indent=2).encode("utf-8"),
+            0o600,
+            dir_mode=0o700,
+        )
     except Exception:
         pass
 
@@ -1348,6 +1518,8 @@ def _select_gemini_base_binary(
     gemini_agy_orig: str,
     orig_sha: str,
     readonly: bool = False,
+    stat_cache: dict | None = None,
+    cache_state: dict | None = None,
 ) -> tuple[str, str | None, str | None, str | None]:
     """
     Selects the newest valid official base binary for Gemini.app/Contents/Helpers/agy:
@@ -1370,10 +1542,31 @@ def _select_gemini_base_binary(
         and (orig_ver is None or local_ver > orig_ver)
     ):
         try:
-            with open(local_agy, "rb") as f:
-                local_bytes = f.read()
-            if not _is_agy_already_patched_bytes(local_bytes):
-                return local_agy, hashlib.sha256(local_bytes).hexdigest(), orig_ver_str, local_ver_str
+            st = os.lstat(local_agy)
+            if stat.S_ISREG(st.st_mode):
+                sig = _file_stat_sig(st)
+                if readonly and stat_cache is not None:
+                    entry = stat_cache.get(local_agy)
+                    if (
+                        isinstance(entry, dict)
+                        and entry.get("sig") == sig
+                        and entry.get("unpatched") is True
+                        and entry.get("sha256")
+                    ):
+                        return local_agy, str(entry["sha256"]), orig_ver_str, local_ver_str
+                with open(local_agy, "rb") as f:
+                    local_bytes = f.read()
+                if not _is_agy_already_patched_bytes(local_bytes):
+                    local_sha = hashlib.sha256(local_bytes).hexdigest()
+                    if stat_cache is not None:
+                        stat_cache[local_agy] = {
+                            "sig": sig,
+                            "sha256": local_sha,
+                            "unpatched": True,
+                        }
+                        if cache_state is not None:
+                            cache_state["dirty"] = True
+                    return local_agy, local_sha, orig_ver_str, local_ver_str
         except Exception:
             pass
 
@@ -1415,7 +1608,7 @@ def ensure_and_patch_gemini_agy(home_dir: str, force: bool = False) -> bool:
         with open(LEGACY_GEMINI_AGY_ORIG, "rb") as lf:
             legacy_bytes = lf.read()
         if not _is_agy_already_patched_bytes(legacy_bytes):
-            _write_exclusive_atomic(gemini_agy_orig, legacy_bytes, 0o600)
+            _write_exclusive_atomic(gemini_agy_orig, legacy_bytes, 0o600, dir_mode=0o700)
 
     for legacy_f in (
         LEGACY_GEMINI_AGY_ORIG,
@@ -1450,15 +1643,16 @@ def ensure_and_patch_gemini_agy(home_dir: str, force: bool = False) -> bool:
             live_data = f.read()
         if not _is_agy_already_patched_bytes(live_data):
             log(f"正在备份 Gemini.app 官方原版 Helpers/agy -> {gemini_agy_orig} ...")
-            _write_exclusive_atomic(gemini_agy_orig, live_data, 0o600)
+            _write_exclusive_atomic(gemini_agy_orig, live_data, 0o600, dir_mode=0o700)
 
     if not os.path.isfile(gemini_agy_orig):
         log(f"警告: 未找到 {gemini_agy_orig} 备份文件，跳过 Gemini.app 内置 agy 补丁")
         return False
 
     orig_sha = compute_sha256(gemini_agy_orig)
+    stat_cache = _load_guard_stat_cache(home_dir)
     base_path, base_sha, orig_ver_str, base_ver_str = _select_gemini_base_binary(
-        home_dir, gemini_agy_orig, orig_sha, readonly=False
+        home_dir, gemini_agy_orig, orig_sha, readonly=False, stat_cache=stat_cache
     )
     need_patch = (
         force
@@ -1467,6 +1661,9 @@ def ensure_and_patch_gemini_agy(home_dir: str, force: bool = False) -> bool:
         or recorded_patched_sha != live_sha
     )
     if not need_patch:
+        _record_stat_cache(stat_cache, gemini_agy_orig, orig_sha)
+        _record_stat_cache(stat_cache, GEMINI_AGY_BIN, live_sha)
+        _save_guard_stat_cache(home_dir, stat_cache)
         ver_note = f"v{base_ver_str}" if base_ver_str else "已就绪"
         log(f"已校验 Gemini 内置 Antigravity 汉化内核就绪 ({ver_note}) -> Gemini.app/Contents/Helpers/agy")
         return False
@@ -1500,7 +1697,11 @@ def ensure_and_patch_gemini_agy(home_dir: str, force: bool = False) -> bool:
             gemini_agy_sha_file,
             f"{orig_sha}:{base_sha}:{patched_sha}\n".encode("utf-8"),
             0o600,
+            dir_mode=0o700,
         )
+        _record_stat_cache(stat_cache, gemini_agy_orig, orig_sha)
+        _record_stat_cache(stat_cache, GEMINI_AGY_BIN, patched_sha)
+        _save_guard_stat_cache(home_dir, stat_cache)
         ver_label = f" (v{base_ver_str})" if base_ver_str else ""
         log(f"已同步并汉化 Gemini 内置 Antigravity 核心二进制{ver_label}与中文标题引擎 -> Gemini.app/Contents/Helpers/agy")
         return True
@@ -1525,10 +1726,13 @@ def apply_all_patches_to_dir(app_dir: str, locale_data: dict, engine_code: str) 
     patch_device_chooser(dist_dir)
     patch_webauthn_and_cable(dist_dir)
     patch_wizard_html(dist_dir)
+    patch_wsl(dist_dir)
     patch_language_server_js(dist_dir)
 
 
-def ensure_and_patch_app(locale_data: dict, engine_code: str, force: bool = False) -> str:
+def ensure_and_patch_app(
+    locale_data: dict, engine_code: str, force: bool = False, home_dir: str | None = None
+) -> str:
     """
     Crash-safe atomic extraction and patching for /Applications/Antigravity.app.
     """
@@ -1581,7 +1785,12 @@ def ensure_and_patch_app(locale_data: dict, engine_code: str, force: bool = Fals
             os.remove(ASAR_DISABLED)
         os.rename(ASAR_FILE, ASAR_DISABLED)
 
-    ensure_and_patch_language_server_bin(force=force)
+    if home_dir and os.path.isfile(ASAR_DISABLED):
+        stat_cache = _load_guard_stat_cache(home_dir)
+        _record_stat_cache(stat_cache, ASAR_DISABLED, current_sha)
+        _save_guard_stat_cache(home_dir, stat_cache)
+
+    ensure_and_patch_language_server_bin(force=force, home_dir=home_dir)
 
     pkg_json_path = os.path.join(UNPACKED_APP_DIR, "package.json")
     app_version = "unknown"
@@ -1624,6 +1833,7 @@ def _is_guard_up_to_date(home_dir: str) -> bool:
     persist_engine = os.path.join(persist_dir, "engine", "dom-translator.js")
     persist_patcher = os.path.join(persist_dir, "patcher.py")
     shared_bundle_file = os.path.join(home_dir, ".gemini", "antigravity", "brain", ".antigravity-zh", "ag-zh.js")
+    shared_cli_bundle_file = os.path.join(home_dir, ".gemini", "antigravity-cli", "brain", ".antigravity-zh", "ag-zh.js")
     legacy_shared_bundle = os.path.join(home_dir, ".gemini", "antigravity", "brain", "ag-zh-bundle.js")
 
     src_mtime = 0.0
@@ -1633,77 +1843,96 @@ def _is_guard_up_to_date(home_dir: str) -> bool:
 
     if os.path.lexists(legacy_shared_bundle):
         return False
-    if not os.path.isfile(shared_bundle_file):
-        return False
-    if src_mtime > os.path.getmtime(shared_bundle_file) + 0.5:
-        return False
+    for bundle_f in (shared_bundle_file, shared_cli_bundle_file):
+        if not os.path.isfile(bundle_f):
+            return False
+        if src_mtime > os.path.getmtime(bundle_f) + 0.5:
+            return False
 
-    if os.path.isdir(APP_PATH) and has_passed_first_launch_gatekeeper(APP_PATH):
-        preload_file = os.path.join(UNPACKED_APP_DIR, "dist", "preload.js")
-        menu_file = os.path.join(UNPACKED_APP_DIR, "dist", "menu.js")
-        ipc_file = os.path.join(UNPACKED_APP_DIR, "dist", "ipcHandlers.js")
-        if os.path.exists(ASAR_FILE) or not os.path.isfile(preload_file):
-            return False
-        if not os.path.isfile(ASAR_DISABLED) or not os.path.isfile(SHA256_STATE_FILE):
-            return False
-        try:
-            with open(SHA256_STATE_FILE, "r", encoding="utf-8") as f:
-                recorded_asar_sha = f.read().strip()
-            if not recorded_asar_sha or compute_sha256(ASAR_DISABLED) != recorded_asar_sha:
+    stat_cache = _load_guard_stat_cache(home_dir)
+    cache_state = {"dirty": False}
+    try:
+        if os.path.isdir(APP_PATH) and has_passed_first_launch_gatekeeper(APP_PATH):
+            preload_file = os.path.join(UNPACKED_APP_DIR, "dist", "preload.js")
+            menu_file = os.path.join(UNPACKED_APP_DIR, "dist", "menu.js")
+            ipc_file = os.path.join(UNPACKED_APP_DIR, "dist", "ipcHandlers.js")
+            if os.path.exists(ASAR_FILE) or not os.path.isfile(preload_file):
                 return False
-        except Exception:
-            return False
-        for patched_js in (preload_file, menu_file, ipc_file):
-            if not os.path.isfile(patched_js):
+            if not os.path.isfile(ASAR_DISABLED) or not os.path.isfile(SHA256_STATE_FILE):
                 return False
-            with open(patched_js, "r", encoding="utf-8", errors="ignore") as f:
-                if PATCH_START_MARKER not in f.read():
+            try:
+                with open(SHA256_STATE_FILE, "r", encoding="utf-8") as f:
+                    recorded_asar_sha = f.read().strip()
+                if (
+                    not recorded_asar_sha
+                    or _fast_sha256_for_guard(ASAR_DISABLED, stat_cache, cache_state) != recorded_asar_sha
+                ):
                     return False
-        if os.path.isfile(LS_ORIG_BIN):
-            if not os.path.isfile(LS_SHA256_STATE_FILE):
+            except Exception:
                 return False
-            with open(LS_SHA256_STATE_FILE, "r", encoding="utf-8") as f:
-                recorded_ls_sha = f.read().strip()
-            if not recorded_ls_sha or compute_sha256(LS_ORIG_BIN) != recorded_ls_sha:
+            for patched_js in (preload_file, menu_file, ipc_file):
+                if not os.path.isfile(patched_js):
+                    return False
+                with open(patched_js, "r", encoding="utf-8", errors="ignore") as f:
+                    if PATCH_START_MARKER not in f.read():
+                        return False
+            if os.path.isfile(LS_ORIG_BIN):
+                if not os.path.isfile(LS_SHA256_STATE_FILE):
+                    return False
+                with open(LS_SHA256_STATE_FILE, "r", encoding="utf-8") as f:
+                    recorded_ls_sha, recorded_ls_status = _parse_ls_sha_state(f.read())
+                if (
+                    not recorded_ls_sha
+                    or _fast_sha256_for_guard(LS_ORIG_BIN, stat_cache, cache_state) != recorded_ls_sha
+                ):
+                    return False
+                if recorded_ls_status == "patched" and not os.path.isfile(LS_ZH_BIN):
+                    return False
+            if src_mtime > os.path.getmtime(preload_file) + 0.5:
                 return False
-        if src_mtime > os.path.getmtime(preload_file) + 0.5:
-            return False
 
-    if os.path.isfile(GEMINI_AGY_BIN) and has_passed_first_launch_gatekeeper(GEMINI_APP_PATH):
-        _, gemini_agy_orig, gemini_agy_sha_file = get_gemini_backup_paths(home_dir)
-        if not os.path.isfile(gemini_agy_orig) or not os.path.isfile(gemini_agy_sha_file):
-            return False
-        try:
-            with open(gemini_agy_sha_file, "r", encoding="utf-8") as f:
-                parts = f.read().strip().split(":")
-            if len(parts) < 3:
+        if os.path.isfile(GEMINI_AGY_BIN) and has_passed_first_launch_gatekeeper(GEMINI_APP_PATH):
+            _, gemini_agy_orig, gemini_agy_sha_file = get_gemini_backup_paths(home_dir)
+            if not os.path.isfile(gemini_agy_orig) or not os.path.isfile(gemini_agy_sha_file):
                 return False
-            orig_sha, base_sha, patched_sha = parts[0], parts[1], parts[2]
-            if not orig_sha or not base_sha or not patched_sha:
+            try:
+                with open(gemini_agy_sha_file, "r", encoding="utf-8") as f:
+                    parts = f.read().strip().split(":")
+                if len(parts) < 3:
+                    return False
+                orig_sha, base_sha, patched_sha = parts[0], parts[1], parts[2]
+                if not orig_sha or not base_sha or not patched_sha:
+                    return False
+                if (
+                    _fast_sha256_for_guard(gemini_agy_orig, stat_cache, cache_state) != orig_sha
+                    or _fast_sha256_for_guard(GEMINI_AGY_BIN, stat_cache, cache_state) != patched_sha
+                ):
+                    return False
+                _, expected_base_sha, _, _ = _select_gemini_base_binary(
+                    home_dir,
+                    gemini_agy_orig,
+                    orig_sha,
+                    readonly=True,
+                    stat_cache=stat_cache,
+                    cache_state=cache_state,
+                )
+                if not expected_base_sha or expected_base_sha != base_sha:
+                    return False
+            except Exception:
                 return False
-            if compute_sha256(gemini_agy_orig) != orig_sha or compute_sha256(GEMINI_AGY_BIN) != patched_sha:
-                return False
-            _, expected_base_sha, _, _ = _select_gemini_base_binary(
-                home_dir, gemini_agy_orig, orig_sha, readonly=True
-            )
-            if not expected_base_sha or expected_base_sha != base_sha:
-                return False
-        except Exception:
-            return False
 
-    return True
+        return True
+    finally:
+        if cache_state["dirty"]:
+            _save_guard_stat_cache(home_dir, stat_cache)
 
 
 def _sh_quote(val: str) -> str:
     return "'" + val.replace("'", "'\"'\"'") + "'"
 
 
-def install_update_guard() -> None:
-    """
-    Syncs runtime files into ~/.antigravity-zh/, writes a self-reference-free guard-runner.sh,
-    and registers ~/Library/LaunchAgents/com.antigravity.zh-cn.plist with stable WatchPaths + 60s patrol.
-    """
-    uid, gid, home_dir = get_real_user_info()
+def sync_persist_runtime_files(home_dir: str) -> None:
+    """将当前仓库核心运行文件原子同步至 ~/.antigravity-zh/，清理过时锁/缓存残留。"""
     persist_dir = os.path.join(home_dir, ".antigravity-zh")
     persist_engine_dir = os.path.join(persist_dir, "engine")
     persist_locales_dir = os.path.join(persist_dir, "locales")
@@ -1713,7 +1942,6 @@ def install_update_guard() -> None:
         os.makedirs(d, mode=0o700, exist_ok=True)
         os.chmod(d, 0o700)
 
-    # Remove legacy lock / guard.js / __pycache__ artifacts inside ~/.antigravity-zh
     for stale_path in (
         os.path.join(persist_dir, ".patcher.lock"),
         os.path.join(persist_dir, "guard.js"),
@@ -1727,15 +1955,39 @@ def install_update_guard() -> None:
             except OSError:
                 pass
 
-    # Copy runtime files to ~/.antigravity-zh if running from another directory
     if os.path.abspath(BASE_DIR) != os.path.abspath(persist_dir):
-        for fname in ("patcher.py", "restore.py"):
-            src = os.path.join(BASE_DIR, fname)
-            dst = os.path.join(persist_dir, fname)
+        copy_specs = [
+            (os.path.join(BASE_DIR, "patcher.py"), os.path.join(persist_dir, "patcher.py"), 0o755),
+            (os.path.join(BASE_DIR, "restore.py"), os.path.join(persist_dir, "restore.py"), 0o755),
+            (ENGINE_FILE, os.path.join(persist_engine_dir, "dom-translator.js"), 0o644),
+            (LOCALE_FILE, os.path.join(persist_locales_dir, "zh-CN.json"), 0o644),
+        ]
+        for src, dst, mode in copy_specs:
             if os.path.isfile(src):
-                shutil.copy2(src, dst)
-        shutil.copy2(ENGINE_FILE, os.path.join(persist_engine_dir, "dom-translator.js"))
-        shutil.copy2(LOCALE_FILE, os.path.join(persist_locales_dir, "zh-CN.json"))
+                with open(src, "rb") as sf:
+                    src_bytes = sf.read()
+                if os.path.isfile(dst) and not os.path.islink(dst):
+                    try:
+                        with open(dst, "rb") as df:
+                            if df.read() == src_bytes:
+                                os.chmod(dst, mode)
+                                continue
+                    except OSError:
+                        pass
+                _write_exclusive_atomic(dst, src_bytes, mode, dir_mode=0o700)
+
+
+def install_update_guard() -> None:
+    """
+    Syncs runtime files into ~/.antigravity-zh/, writes a self-reference-free guard-runner.sh,
+    and registers ~/Library/LaunchAgents/com.antigravity.zh-cn.plist with stable WatchPaths + 60s patrol.
+    """
+    uid, gid, home_dir = get_real_user_info()
+    sync_persist_runtime_files(home_dir)
+
+    persist_dir = os.path.join(home_dir, ".antigravity-zh")
+    persist_engine_dir = os.path.join(persist_dir, "engine")
+    persist_locales_dir = os.path.join(persist_dir, "locales")
 
     persist_patcher = os.path.join(persist_dir, "patcher.py")
     persist_guard_runner = os.path.join(persist_dir, "guard-runner.sh")
@@ -1772,7 +2024,7 @@ def install_update_guard() -> None:
         "fi\n"
         "exec \"$PYTHON_BIN\" \"$PATCHER_PY\" --guard\n"
     )
-    _write_exclusive_atomic(persist_guard_runner, runner_script.encode("utf-8"), 0o700)
+    _write_exclusive_atomic(persist_guard_runner, runner_script.encode("utf-8"), 0o700, dir_mode=0o700)
 
     # Watch ONLY stable persistent parent directories so macOS WatchPaths vnodes never dangle on app updates.
     # Lightweight 60s StartInterval covers in-place bundle resource swaps & Gatekeeper first-launch completion.
@@ -1819,14 +2071,43 @@ def install_update_guard() -> None:
 
 
 def _append_guard_log(home_dir: str, text: str) -> None:
+    """安全追加守护日志并在超过 512KB 时自动原子轮转至末尾 256KB。"""
     log_path = os.path.join(home_dir, ".antigravity-guard.log")
+    max_bytes = 512 * 1024
+    keep_bytes = 256 * 1024
     try:
+        if os.path.islink(log_path):
+            return
+        if os.path.lexists(log_path):
+            st_pre = os.lstat(log_path)
+            if not stat.S_ISREG(st_pre.st_mode):
+                return
         flags = os.O_CREAT | os.O_APPEND | os.O_WRONLY
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
+        if hasattr(os, "O_NONBLOCK"):
+            flags |= os.O_NONBLOCK
         fd = os.open(log_path, flags, 0o600)
-        with os.fdopen(fd, "a", encoding="utf-8") as f:
-            f.write(text)
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                return
+            with os.fdopen(fd, "a", encoding="utf-8") as f:
+                fd = -1
+                f.write(text)
+                f.flush()
+        finally:
+            if fd >= 0:
+                os.close(fd)
+        st_post = os.lstat(log_path)
+        if stat.S_ISREG(st_post.st_mode) and st_post.st_size > max_bytes:
+            with open(log_path, "rb") as rf:
+                rf.seek(-keep_bytes, os.SEEK_END)
+                tail = rf.read()
+            nl_pos = tail.find(b"\n")
+            if nl_pos >= 0:
+                tail = tail[nl_pos + 1 :]
+            _write_exclusive_atomic(log_path, tail, 0o600, dir_mode=0o755)
     except Exception:
         pass
 
@@ -1892,12 +2173,15 @@ def main() -> None:
         with open(ENGINE_FILE, "r", encoding="utf-8") as f:
             engine_code = f.read()
 
-        shared_bundle = write_shared_web_bundle(locale_data, engine_code, home_dir)
+        if not args.guard:
+            sync_persist_runtime_files(home_dir)
+
+        write_shared_web_bundle(locale_data, engine_code, home_dir)
         persist_backup_dir, gemini_agy_orig, gemini_agy_sha_file = get_gemini_backup_paths(home_dir)
 
         try:
             if os.path.isdir(APP_PATH):
-                ensure_and_patch_app(locale_data, engine_code, force=args.force)
+                ensure_and_patch_app(locale_data, engine_code, force=args.force, home_dir=home_dir)
             gemini_patched = ensure_and_patch_gemini_agy(home_dir=home_dir, force=args.force)
         except PermissionError:
             msg = (
@@ -1912,9 +2196,8 @@ def main() -> None:
             sys.exit(1)
 
         if os.geteuid() == 0 and uid != 0:
-            brain_root = os.path.join(home_dir, ".gemini", "antigravity", "brain")
-            shared_bundle_dir = os.path.dirname(shared_bundle)
             guard_log_path = os.path.join(home_dir, ".antigravity-guard.log")
+            stat_cache_path = os.path.join(persist_backup_dir, GUARD_STAT_CACHE_NAME)
             for p in (
                 UNPACKED_APP_DIR,
                 ASAR_DISABLED,
@@ -1926,13 +2209,30 @@ def main() -> None:
                 persist_backup_dir,
                 gemini_agy_orig,
                 gemini_agy_sha_file,
+                stat_cache_path,
                 guard_log_path,
-                brain_root,
-                shared_bundle_dir,
-                shared_bundle,
             ):
                 if os.path.exists(p):
                     subprocess.run(["chown", "-R", f"{uid}:{gid}", p], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+            gemini_root = os.path.join(home_dir, ".gemini")
+            for app_data_name in ("antigravity", "antigravity-cli"):
+                app_data_dir = os.path.join(gemini_root, app_data_name)
+                brain_dir = os.path.join(app_data_dir, "brain")
+                for d in (gemini_root, app_data_dir, brain_dir):
+                    if os.path.isdir(d) and not os.path.islink(d):
+                        try:
+                            if os.lstat(d).st_uid == 0:
+                                os.chown(d, uid, gid)
+                        except OSError:
+                            pass
+                bundle_sub_dir = os.path.join(brain_dir, ".antigravity-zh")
+                if os.path.exists(bundle_sub_dir):
+                    subprocess.run(
+                        ["chown", "-R", f"{uid}:{gid}", bundle_sub_dir],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
 
         if not args.no_install_guard:
             install_update_guard()

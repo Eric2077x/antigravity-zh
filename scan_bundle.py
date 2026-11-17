@@ -1,76 +1,340 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-Antigravity Frontend Bundle UI String Scanner (scan_bundle.py)
-Automatically locates the active local Language Server HTTPS port from
-~/Library/Logs/Antigravity/main.log, downloads the live /main.js bundle,
-and checks for any untranslated UI strings against locales/zh-CN.json.
+Antigravity / Gemini 双端内嵌前端 Bundle 漏翻审计工具。
+
+默认同时读取：
+- /Applications/Antigravity.app/Contents/Resources/bin/language_server
+- /Applications/Gemini.app/Contents/Helpers/agy（回退 ~/.local/bin/agy）
+按 PK\\x05\\x06 EOCD 精确切片尾部 ZIP 中的 main.js，提取设置表字段
+（displayName / shortDescription / longDescription / subtitle / options 等）、
+React.createElement 子文本、普通字符串与动态模板字符串，并与
+locales/zh-CN.json（exact / fragments）及 engine/dom-translator.js（DYNAMIC_RULES / DOM_SKIP_EXACT）
+比对覆盖情况。
 """
 
+import argparse
+import io
 import json
 import os
 import re
-import ssl
-import sys
+import shutil
+import struct
+import subprocess
 import urllib.request
+import zipfile
+from collections import Counter
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-LOCALE_FILE = os.path.join(BASE_DIR, "locales", "zh-CN.json")
-ELECTRON_LOG = os.path.expanduser("~/Library/Logs/Antigravity/main.log")
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+LOCALE_PATH = os.path.join(SCRIPT_DIR, "locales", "zh-CN.json")
+ENGINE_PATH = os.path.join(SCRIPT_DIR, "engine", "dom-translator.js")
+
+ELECTRON_BIN = "/Applications/Antigravity.app/Contents/MacOS/Antigravity"
+DEFAULT_TARGETS = [
+    (
+        "Antigravity.app (language_server)",
+        ["/Applications/Antigravity.app/Contents/Resources/bin/language_server"],
+    ),
+    (
+        "Gemini.app (agy)",
+        [
+            "/Applications/Gemini.app/Contents/Helpers/agy",
+            os.path.expanduser("~/.local/bin/agy"),
+        ],
+    ),
+]
+
+SETTINGS_FIELDS = (
+    "displayName",
+    "shortDescription",
+    "longDescription",
+    "subtitle",
+    "label",
+    "title",
+    "description",
+    "placeholder",
+    "tooltip",
+    "subtext",
+    "emptyText",
+    "heading",
+    "helperText",
+    "aria-label",
+    "data-tooltip",
+    "data-placeholder",
+)
+
+FIELD_KV_RE = re.compile(
+    r"""(?:['"])?(?P<field>"""
+    + "|".join(re.escape(k) for k in SETTINGS_FIELDS)
+    + r""")(?:['"])?\s*:\s*(?P<q>["'])(?P<text>(?:\\.|(?!\2)[^\\\r\n]){2,500})(?P=q)"""
+)
+OPTIONS_LABEL_RE = re.compile(
+    r"""options\s*:\s*\[(?P<body>[^\[\]]{1,4000})\]"""
+)
+CREATE_ELEM_CHILD_RE = re.compile(
+    r"""\.createElement\([^,\n]{1,60},\s*(?:null|\{[^}\n]{0,300}\})\s*,\s*(?P<q>["'])(?P<text>(?:\\.|[^"'\\\r\n]){2,240})(?P=q)"""
+)
+TEMPLATE_RE = re.compile(r"""`(?P<text>(?:\\.|[^`\\\r\n]){3,240})`""")
+PLAIN_STR_RE = re.compile(r"""(?P<q>["'])(?P<text>[A-Z][A-Za-z0-9 .,?!:;'"/()\-–—%+\u2026]{1,180})(?P=q)""")
+
+SKIP_RE = re.compile(
+    r"""^(?:https?://|file://|/|~|--[a-z0-9-]+|[A-Za-z0-9_]+\.[a-z]{2,5}$|[a-z]+(?:[A-Z][a-z0-9]+)+$|[A-Z0-9_]{2,}$|#[0-9a-fA-F]{3,8}$|\d+[%pxremvhw]*$)"""
+)
+WORD_RE = re.compile(r"""[A-Za-z]{2,}""")
 
 
-def find_live_url() -> str:
-    if not os.path.isfile(ELECTRON_LOG):
-        raise FileNotFoundError(f"未找到日志文件: {ELECTRON_LOG}")
-    with open(ELECTRON_LOG, "r", encoding="utf-8", errors="ignore") as f:
-        text = f.read()
-    matches = re.findall(r"https://127\.0\.0\.1:\d+/", text)
-    if not matches:
-        raise RuntimeError("未在 main.log 中检测到活动的本地服务端口")
-    return matches[-1]
+def _decode_js_escapes(text: str) -> str:
+    """解码常见 JS 字符串与 \\uXXXX 转义字符，避免误把转义序列当作漏翻文本。"""
+    decoded = re.sub(r"\\u([0-9a-fA-F]{4})", lambda m: chr(int(m.group(1), 16)), text)
+    return (
+        decoded.replace(r"\"", '"')
+        .replace(r"\'", "'")
+        .replace(r"\n", " ")
+        .replace(r"\t", " ")
+        .strip()
+    )
 
 
-def fetch_bundle(base_url: str) -> str:
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    url = base_url.rstrip("/") + "/main.js"
-    print(f"正在从 {url} 下载前端 bundle...")
-    with urllib.request.urlopen(url, context=ctx, timeout=10) as resp:
-        return resp.read().decode("utf-8", errors="replace")
+def _is_candidate_ui_text(text: str, allow_short: bool = False) -> bool:
+    """过滤代码标识符、样式类、路径等非用户可见文本。"""
+    t = text.strip()
+    if len(t) < (2 if allow_short else 4):
+        return False
+    if not WORD_RE.search(t):
+        return False
+    if SKIP_RE.match(t):
+        return False
+    if any(tok in t for tok in ("function(", "=>", "className", "rgba(", "var(--", "px ", ";base64,")):
+        return False
+    if " " not in t and ("-" in t or "_" in t or "/" in t or "." in t or t.islower()):
+        return False
+    return True
 
 
-def extract_ui_candidates(js: str) -> set:
-    candidates = set()
-    patterns = [
-        r'(?:label|title|placeholder|description|tooltip|aria-label|header|heading|subtext|emptyText)\s*:\s*"([^"\n\\]{2,80})"',
-        r"children\s*:\s*\"([A-Z][A-Za-z0-9 ,.'?!:/()-]{2,80})\"",
-    ]
-    for pat in patterns:
-        for m in re.finditer(pat, js):
-            s = m.group(1).strip()
-            if re.search(r"[a-zA-Z]{2,}", s) and not s.startswith(("http", "/", "var(", "calc(")):
-                candidates.add(s)
-    return candidates
+def read_embedded_main_js(binary_path: str) -> str:
+    """按 PK\\x05\\x06 EOCD 精确切片 Mach-O 尾部内嵌 ZIP，返回 main.js 文本。"""
+    with open(binary_path, "rb") as f:
+        data = f.read()
+    eocd_pos = data.rfind(b"PK\x05\x06")
+    if eocd_pos < 0:
+        raise ValueError(f"未找到 ZIP EOCD 标记: {binary_path}")
+    eocd = data[eocd_pos : eocd_pos + 22]
+    _, _, _, _, _, cd_size, cd_offset, comment_len = struct.unpack("<4sHHHHIIH", eocd)
+    zip_start = eocd_pos - cd_size - cd_offset
+    zip_end = eocd_pos + 22 + comment_len
+    if zip_start < 0 or data[zip_start : zip_start + 4] != b"PK\x03\x04":
+        raise ValueError(f"内嵌 ZIP 偏移校验失败 ({hex(zip_start)}): {binary_path}")
+    with zipfile.ZipFile(io.BytesIO(data[zip_start:zip_end])) as zf:
+        for name in zf.namelist():
+            if name.endswith("main.js"):
+                return zf.read(name).decode("utf-8", errors="replace")
+    raise FileNotFoundError(f"内嵌 ZIP 中未找到 main.js: {binary_path}")
 
 
-def main() -> None:
-    with open(LOCALE_FILE, "r", encoding="utf-8") as f:
-        locale = json.load(f)
-    exact = locale.get("exact", {})
+def read_live_main_js() -> str:
+    """兼容旧版：从 Antigravity main.log 读取当前运行中的本地 webview 端口 main.js。"""
+    log_path = os.path.expanduser("~/Library/Logs/Antigravity/main.log")
+    with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+        ports = re.findall(r"127\.0\.0\.1:(\d+)", f.read())
+    if not ports:
+        raise RuntimeError(f"日志中未发现运行端口: {log_path}")
+    url = f"http://127.0.0.1:{ports[-1]}/main.js"
+    return urllib.request.urlopen(url, timeout=10).read().decode("utf-8", errors="replace")
 
-    base_url = find_live_url()
-    js = fetch_bundle(base_url)
-    candidates = extract_ui_candidates(js)
 
-    covered = [s for s in candidates if s in exact or s.rstrip(":") in exact]
-    missing = sorted(s for s in candidates if s not in exact and s.rstrip(":") not in exact)
+def extract_candidates(js_text: str) -> dict[str, list[str]]:
+    """分类提取设置表字段、JSX 子文本、模板字符串与常规 UI 文本。"""
+    field_strings: dict[str, set[str]] = {
+        "settings_fields": set(),
+        "jsx_children": set(),
+        "templates": set(),
+        "ui_strings": set(),
+    }
 
-    print(f"扫描完成: 候选 UI 词条 {len(candidates)} 条，已精确覆盖 {len(covered)} 条，未收录候选 {len(missing)} 条。")
-    if missing and "--verbose" in sys.argv:
-        for s in missing[:100]:
-            print("  -", s)
+    for m in FIELD_KV_RE.finditer(js_text):
+        txt = _decode_js_escapes(m.group("text"))
+        if _is_candidate_ui_text(txt, allow_short=True):
+            field_strings["settings_fields"].add(txt)
+
+    for om in OPTIONS_LABEL_RE.finditer(js_text):
+        for lm in re.finditer(r"""(?:label|title)\s*:\s*(?P<q>["'])(?P<text>(?:\\.|[^"'\\\r\n]){1,120})(?P=q)""", om.group("body")):
+            txt = _decode_js_escapes(lm.group("text"))
+            if _is_candidate_ui_text(txt, allow_short=True):
+                field_strings["settings_fields"].add(txt)
+
+    for m in CREATE_ELEM_CHILD_RE.finditer(js_text):
+        txt = _decode_js_escapes(m.group("text"))
+        if _is_candidate_ui_text(txt, allow_short=True):
+            field_strings["jsx_children"].add(txt)
+
+    for m in TEMPLATE_RE.finditer(js_text):
+        raw = m.group("text")
+        if "${" not in raw:
+            continue
+        # 将插值归一化为可探测占位的示例文本，计数类表达式占位为 "2" 以避免正则检测假阳性
+        def _tpl_placeholder(match: re.Match) -> str:
+            expr = match.group(0)[2:-1]
+            head = raw[: match.start()]
+            tail = raw[match.end() :]
+            if (
+                re.match(
+                    r"\s*(?:tokens?|commits?|steps?|files?|items?|plugins?|conversations?|comments?|overrides?|breakdowns?|subagents?|references|seconds?|minutes?|hours?|days?|ms|s|MB|KB|%)\b",
+                    tail,
+                    re.I,
+                )
+                or re.search(
+                    r"\b(?:Question|Step|Turn|Page|Slide|Version|code|port|attempt)\s+$",
+                    head,
+                    re.I,
+                )
+                or any(tok in expr for tok in (".length", "numTokens", "size", "count"))
+            ):
+                return "2"
+            return "Item"
+
+        normalized = re.sub(r"\$\{[^}]+\}", _tpl_placeholder, raw)
+        txt = _decode_js_escapes(normalized)
+        if _is_candidate_ui_text(txt) and not any(tok in raw for tok in ("http", "rgb(", "rgba(", "className", "Error:", "console.")):
+            field_strings["templates"].add(f"{txt}  <<<  `{raw}`")
+
+    for m in PLAIN_STR_RE.finditer(js_text):
+        txt = _decode_js_escapes(m.group("text"))
+        if _is_candidate_ui_text(txt) and txt not in field_strings["settings_fields"]:
+            field_strings["ui_strings"].add(txt)
+
+    return {k: sorted(v) for k, v in field_strings.items()}
+
+
+def _normalize_template_sample(item: str) -> tuple[str, str]:
+    """拆分 `sample  <<<  raw_template` 以便用真实译文引擎检测覆盖率。"""
+    if "  <<<  `" in item:
+        sample, raw = item.split("  <<<  ", 1)
+        return sample.strip(), raw.strip()
+    return item, item
+
+
+def _eval_with_engine_js(candidates: list[str]) -> dict[str, bool] | None:
+    """优先调用 Electron Node 运行真实 engine/dom-translator.js 检测覆盖情况。"""
+    node_bin = ELECTRON_BIN if os.path.exists(ELECTRON_BIN) else shutil.which("node")
+    if not node_bin:
+        return None
+    env = os.environ.copy()
+    if node_bin == ELECTRON_BIN:
+        env["ELECTRON_RUN_AS_NODE"] = "1"
+
+    js_probe = r"""
+const fs = require('fs');
+const vm = require('vm');
+const chunks = [];
+process.stdin.on('data', (c) => chunks.push(c));
+process.stdin.on('end', () => {
+  const input = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+  const zh = JSON.parse(fs.readFileSync(input.localePath, 'utf8'));
+  const src = fs.readFileSync(input.enginePath, 'utf8');
+  const sandbox = {
+    __AG_ZH_LOCALE__: zh,
+    window: { addEventListener: () => {} },
+    document: { readyState: 'loading', addEventListener: () => {}, createElement: () => ({ style: {}, setAttribute: () => {}, appendChild: () => {} }), documentElement: { tagName: 'HTML' }, title: '' },
+    MutationObserver: function() { return { observe: () => {} }; },
+    Node: { TEXT_NODE: 3, ELEMENT_NODE: 1 },
+    setTimeout, clearTimeout, setInterval: () => 0, clearInterval, requestAnimationFrame: () => 0,
+    console, String, RegExp, Object, Array, Set, Map, Math, Number, Error, JSON, Promise,
+  };
+  sandbox.self = sandbox.window;
+  sandbox.globalThis = sandbox.window;
+  const code = src.replace('function translateString(', 'window.__probeTranslate = translateString;\nwindow.__probeSkip = shouldSkipText;\nfunction translateString(');
+  vm.runInNewContext(code, sandbox);
+  const res = {};
+  for (const s of input.strings) {
+    res[s] = Boolean(sandbox.window.__probeSkip(s) || sandbox.window.__probeTranslate(s));
+  }
+  process.stdout.write(JSON.stringify(res));
+});
+"""
+    payload = json.dumps({"localePath": LOCALE_PATH, "enginePath": ENGINE_PATH, "strings": candidates})
+    proc = subprocess.run(
+        [node_bin, "-e", js_probe],
+        input=payload,
+        text=True,
+        capture_output=True,
+        env=env,
+        timeout=30,
+    )
+    if proc.returncode != 0:
+        return None
+    return json.loads(proc.stdout)
+
+
+def check_coverage(cat_map: dict[str, list[str]], zh_data: dict) -> tuple[dict[str, list[str]], Counter]:
+    """结合 exact、fragments 与 dom-translator.js 引擎规则统计已覆盖与疑漏词条。"""
+    exact = zh_data.get("exact", {})
+    fragments = [pair[0] for pair in zh_data.get("fragments", []) if pair and pair[0]]
+
+    probe_inputs: list[str] = []
+    for cat, items in cat_map.items():
+        for it in items:
+            sample, _ = _normalize_template_sample(it)
+            probe_inputs.append(sample)
+
+    engine_hits = _eval_with_engine_js(sorted(set(probe_inputs)))
+    missing: dict[str, list[str]] = {cat: [] for cat in cat_map}
+    stats: Counter = Counter()
+
+    for cat, items in cat_map.items():
+        for it in items:
+            sample, _ = _normalize_template_sample(it)
+            stats["total"] += 1
+            if sample in exact or any(sample.startswith(f) for f in fragments):
+                stats["covered_dict"] += 1
+                continue
+            if engine_hits is not None and engine_hits.get(sample):
+                stats["covered_engine"] += 1
+                continue
+            stats["missing"] += 1
+            missing[cat].append(it)
+    return missing, stats
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Antigravity / Gemini 双端内嵌 main.js 漏翻审计")
+    parser.add_argument("--live", action="store_true", help="扫描 main.log 中当前运行端口的在线 main.js")
+    parser.add_argument("--limit", type=int, default=40, help="每个分类最多展示的疑漏条目数")
+    args = parser.parse_args()
+
+    with open(LOCALE_PATH, "r", encoding="utf-8") as f:
+        zh_data = json.load(f)
+
+    targets: list[tuple[str, str]] = []
+    if args.live:
+        targets.append(("Live main.js (main.log)", read_live_main_js()))
+    else:
+        for label, candidates in DEFAULT_TARGETS:
+            found = next((p for p in candidates if os.path.exists(p)), None)
+            if found:
+                targets.append((f"{label} -> {found}", read_embedded_main_js(found)))
+
+    if not targets:
+        print("未找到任何可扫描的 Antigravity / Gemini 目标文件。")
+        return 1
+
+    print(f"词库加载完成: exact={len(zh_data.get('exact', {}))}, fragments={len(zh_data.get('fragments', []))}")
+    for label, js_text in targets:
+        cats = extract_candidates(js_text)
+        missing, stats = check_coverage(cats, zh_data)
+        print(f"\n=== {label} (main.js={len(js_text)} B) ===")
+        print(
+            f"候选项总计={stats['total']} | 词库命中={stats['covered_dict']} | "
+            f"动态/白名单命中={stats['covered_engine']} | 待核查疑漏={stats['missing']}"
+        )
+        for cat, items in missing.items():
+            if not items:
+                continue
+            print(f"  [{cat}] ({len(items)} 项):")
+            for item in items[: args.limit]:
+                print(f"    - {item}")
+            if len(items) > args.limit:
+                print(f"    ... 另有 {len(items) - args.limit} 项未展开")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

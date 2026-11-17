@@ -176,16 +176,31 @@ def restore_gemini_agy(uid: int, gid: int, home_dir: str) -> bool:
 
     restored = False
     if backup_src is not None:
+        st_src = os.lstat(backup_src)
+        if not stat.S_ISREG(st_src.st_mode):
+            raise PermissionError(f"安全拦截：备份文件不是普通文件 {backup_src}")
         print(f"正在从官方备份恢复 Gemini.app Helpers/agy ({backup_src})...")
         restore_tmp = os.path.join(GEMINI_HELPERS_DIR, f".agy.restore-{os.getpid()}")
         if os.path.lexists(restore_tmp):
             os.unlink(restore_tmp)
-        shutil.copy2(backup_src, restore_tmp)
-        os.chmod(restore_tmp, 0o755)
-        if os.geteuid() == 0 and uid != 0:
-            os.chown(restore_tmp, uid, gid)
-        os.replace(restore_tmp, GEMINI_AGY_BIN)
-        restored = True
+        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(restore_tmp, flags, 0o755)
+        try:
+            with os.fdopen(fd, "wb") as dst_f, open(backup_src, "rb") as src_f:
+                shutil.copyfileobj(src_f, dst_f, length=1024 * 1024)
+                dst_f.flush()
+                os.fsync(dst_f.fileno())
+            os.chmod(restore_tmp, 0o755)
+            if os.geteuid() == 0 and uid != 0:
+                os.chown(restore_tmp, uid, gid)
+            os.replace(restore_tmp, GEMINI_AGY_BIN)
+            restored = True
+        except Exception:
+            if os.path.lexists(restore_tmp):
+                os.unlink(restore_tmp)
+            raise
     elif os.path.isfile(GEMINI_AGY_BIN):
         verify = subprocess.run(
             ["codesign", "--verify", "--strict", GEMINI_AGY_BIN],
@@ -209,18 +224,19 @@ def restore_gemini_agy(uid: int, gid: int, home_dir: str) -> bool:
 
 
 def clean_shared_bundles_and_persist_dir(home_dir: str) -> None:
-    brain_dir = os.path.join(home_dir, ".gemini", "antigravity", "brain")
-    shared_dir = os.path.join(brain_dir, ".antigravity-zh")
-    if os.path.isdir(shared_dir) and not os.path.islink(shared_dir):
-        shutil.rmtree(shared_dir, ignore_errors=True)
-        print(f"已清理双端共享 Web 汉化目录: {shared_dir}")
-    elif os.path.lexists(shared_dir):
-        os.unlink(shared_dir)
+    for app_data_name in ("antigravity", "antigravity-cli"):
+        brain_dir = os.path.join(home_dir, ".gemini", app_data_name, "brain")
+        shared_dir = os.path.join(brain_dir, ".antigravity-zh")
+        if os.path.isdir(shared_dir) and not os.path.islink(shared_dir):
+            shutil.rmtree(shared_dir, ignore_errors=True)
+            print(f"已清理双端共享 Web 汉化目录: {shared_dir}")
+        elif os.path.lexists(shared_dir):
+            os.unlink(shared_dir)
 
-    for legacy_name in ("ag-zh-bundle.js",):
-        _remove_file_if_exists(os.path.join(brain_dir, legacy_name))
-    for tmp_bundle in glob.glob(os.path.join(brain_dir, ".ag-zh-bundle.js.staging*")):
-        _remove_file_if_exists(tmp_bundle)
+        for legacy_name in ("ag-zh-bundle.js",):
+            _remove_file_if_exists(os.path.join(brain_dir, legacy_name))
+        for tmp_bundle in glob.glob(os.path.join(brain_dir, ".ag-zh-bundle.js.staging*")):
+            _remove_file_if_exists(tmp_bundle)
 
     persist_dir = os.path.join(home_dir, ".antigravity-zh")
     if os.path.isdir(persist_dir) and not os.path.islink(persist_dir):
@@ -237,7 +253,7 @@ def main() -> None:
     args = parser.parse_args()
 
     uid, gid, home_dir = get_real_user_info()
-    lock_f, lock_path = acquire_lock(uid, gid)
+    lock_f, _ = acquire_lock(uid, gid)
 
     try:
         # Remove LaunchAgent first so WatchPaths cannot re-patch while restoring
@@ -273,10 +289,6 @@ def main() -> None:
     finally:
         fcntl.flock(lock_f, fcntl.LOCK_UN)
         lock_f.close()
-        try:
-            os.unlink(lock_path)
-        except OSError:
-            pass
 
 
 if __name__ == "__main__":
