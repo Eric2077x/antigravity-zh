@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import hashlib
+import inspect
 import io
 import json
 import os
@@ -121,11 +122,15 @@ NEW_TITLE_PROMPT_626 = _NEW_TITLE_PROMPT_626_RAW + b" " * (
 )
 
 NEW_INDEX_HTML_LOADER = (
-    b"\n      try{var s=document.createElement('script');"
-    b"s.src='/static/artifacts/.antigravity-zh/ag-zh.js?csrf='+encodeURIComponent((window.__APP_CONFIG__&&window.__APP_CONFIG__.csrfToken)||'');"
-    b"document.head.appendChild(s)}catch(e){}"
+    b"\n;(function(){function load(){try{var c=window.__APP_CONFIG__;if(!c)return;"
+    b"var s=document.createElement('script');"
+    b"s.src='/static/artifacts/.antigravity-zh/ag-zh.js?csrf='+encodeURIComponent(c.csrfToken||'');"
+    b"document.head.appendChild(s)}catch(e){}}"
+    b"if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',load,{once:true});else load()})();"
 )
 
+GEMINI_BINARY_PATCH_REVISION = 2
+GOOGLE_SIGNING_REQ = '=anchor apple generic and certificate leaf[subject.OU] = "EQHXZ8M8AV"'
 LAUNCH_AGENT_LABEL = "com.antigravity.zh-cn"
 
 PATCH_START_MARKER = "// === ANTIGRAVITY_ZH_PATCH_START ==="
@@ -333,8 +338,11 @@ def _save_guard_stat_cache(home_dir: str, cache: dict) -> None:
 
 
 def _file_stat_sig(st: os.stat_result) -> str:
-    """生成用于校验文件未变化的轻量 stat 指纹。"""
-    return f"{st.st_size}:{getattr(st, 'st_mtime_ns', int(st.st_mtime))}:{st.st_ino}"
+    """生成用于校验文件未变化的轻量 stat 指纹（含设备号、inode、大小、mtime 与 ctime）。"""
+    return (
+        f"{st.st_dev}:{st.st_ino}:{st.st_size}:"
+        f"{getattr(st, 'st_mtime_ns', int(st.st_mtime))}:{getattr(st, 'st_ctime_ns', 0)}"
+    )
 
 
 def _record_stat_cache(cache: dict, filepath: str, sha: str) -> None:
@@ -365,15 +373,17 @@ def _fast_sha256_for_guard(filepath: str, cache: dict, state: dict) -> str:
     return sha
 
 
-def _parse_ls_sha_state(raw: str) -> tuple[str, str]:
-    """解析 .zh_ls_sha256 状态行（兼容旧版纯 SHA256 与新版 `<sha>:<status>`）。"""
+def _parse_ls_sha_state(raw: str) -> tuple[str, str, str]:
+    """解析 .zh_ls_sha256 状态行（兼容 `<sha>`、`<sha>:<status>` 与 `<sha>:<status>:<patched_sha>`）。"""
     text = (raw or "").strip()
     if not text:
-        return "", ""
-    if ":" in text:
-        sha, status = text.split(":", 1)
-        return sha.strip(), (status.strip() or "patched")
-    return text, "patched"
+        return "", "", ""
+    parts = text.split(":")
+    if len(parts) >= 3:
+        return parts[0].strip(), (parts[1].strip() or "patched"), parts[2].strip()
+    if len(parts) == 2:
+        return parts[0].strip(), (parts[1].strip() or "patched"), ""
+    return text, "patched", ""
 
 
 def verify_asar_complete(asar_path: str) -> bool:
@@ -1058,22 +1068,31 @@ def ensure_and_patch_language_server_bin(force: bool = False, home_dir: str | No
         return
 
     current_ls_sha = compute_sha256(LS_ORIG_BIN)
+    stat_cache = _load_guard_stat_cache(home_dir) if home_dir else {}
     if home_dir:
-        stat_cache = _load_guard_stat_cache(home_dir)
         _record_stat_cache(stat_cache, LS_ORIG_BIN, current_ls_sha)
-        _save_guard_stat_cache(home_dir, stat_cache)
 
-    recorded_ls_sha, recorded_ls_status = "", ""
+    recorded_ls_sha, recorded_ls_status, recorded_patched_sha = "", "", ""
     if os.path.isfile(LS_SHA256_STATE_FILE):
         with open(LS_SHA256_STATE_FILE, "r", encoding="utf-8") as f:
-            recorded_ls_sha, recorded_ls_status = _parse_ls_sha_state(f.read())
+            recorded_ls_sha, recorded_ls_status, recorded_patched_sha = _parse_ls_sha_state(f.read())
 
+    live_ls_zh_sha = compute_sha256(LS_ZH_BIN) if (os.path.isfile(LS_ZH_BIN) and not os.path.islink(LS_ZH_BIN)) else ""
     need_patch = (
         force
         or recorded_ls_sha != current_ls_sha
-        or (recorded_ls_status == "patched" and not os.path.isfile(LS_ZH_BIN))
+        or recorded_ls_status not in ("patched", "unmatched")
+        or (recorded_ls_status == "unmatched" and os.path.lexists(LS_ZH_BIN))
+        or (
+            recorded_ls_status == "patched"
+            and (not recorded_patched_sha or not live_ls_zh_sha or live_ls_zh_sha != recorded_patched_sha)
+        )
     )
     if not need_patch:
+        if home_dir:
+            if live_ls_zh_sha:
+                _record_stat_cache(stat_cache, LS_ZH_BIN, live_ls_zh_sha)
+            _save_guard_stat_cache(home_dir, stat_cache)
         log("已校验原生中文对话标题引擎就绪 -> Resources/bin/language_server_zh")
         return
 
@@ -1082,9 +1101,13 @@ def ensure_and_patch_language_server_bin(force: bool = False, home_dir: str | No
 
     patched_data, replaced = _patch_title_prompt_bytes(data)
     if not replaced:
+        if os.path.lexists(LS_ZH_BIN):
+            os.unlink(LS_ZH_BIN)
         _write_exclusive_atomic(
             LS_SHA256_STATE_FILE, f"{current_ls_sha}:unmatched\n".encode("utf-8"), 0o644
         )
+        if home_dir:
+            _save_guard_stat_cache(home_dir, stat_cache)
         log("警告: 未在 language_server 中匹配到默认英文标题提示词，已记录状态跳过二进制替换")
         return
 
@@ -1097,9 +1120,13 @@ def ensure_and_patch_language_server_bin(force: bool = False, home_dir: str | No
         _codesign_single_binary(LS_ZH_STAGING_BIN, orig_ident, orig_ent, ent_plist)
         _clear_quarantine_xattr(LS_ZH_STAGING_BIN, recursive=False)
         os.replace(LS_ZH_STAGING_BIN, LS_ZH_BIN)
+        patched_ls_sha = compute_sha256(LS_ZH_BIN)
         _write_exclusive_atomic(
-            LS_SHA256_STATE_FILE, f"{current_ls_sha}:patched\n".encode("utf-8"), 0o644
+            LS_SHA256_STATE_FILE, f"{current_ls_sha}:patched:{patched_ls_sha}\n".encode("utf-8"), 0o644
         )
+        if home_dir:
+            _record_stat_cache(stat_cache, LS_ZH_BIN, patched_ls_sha)
+            _save_guard_stat_cache(home_dir, stat_cache)
         log("已生成原生中文对话标题引擎 -> Resources/bin/language_server_zh")
     except Exception as e:
         if os.path.lexists(LS_ZH_STAGING_BIN):
@@ -1272,7 +1299,7 @@ def _rebuild_embedded_zip(orig_zip_bytes: bytes, recompress_css: bool = False) -
         cd = struct.pack(
             "<4sHHHHHHIIIHHHHHII",
             b"PK\x01\x02",
-            info.create_version,
+            (info.create_system << 8) | info.create_version,
             info.extract_version,
             flag_bits,
             comp_type,
@@ -1299,6 +1326,8 @@ def _rebuild_embedded_zip(orig_zip_bytes: bytes, recompress_css: bool = False) -
     diff = len(orig_zip_bytes) - base_zip_len
     if diff < 0:
         return b"", diff
+    if diff > 0xFFFF:
+        raise ValueError("ZIP 填充长度超出 EOCD 注释 65535 字节上限")
 
     pad_comment = b" " * diff
     new_eocd = (
@@ -1446,9 +1475,27 @@ def _save_gemini_ver_cache(backup_dir: str, cache: dict) -> None:
         pass
 
 
+def _is_trusted_agy_binary(bin_path: str) -> bool:
+    """校验目标二进制是否具备有效的 Google 官方 Apple 代码签名（防止执行或选用来历不明文件）。"""
+    try:
+        if not os.path.isfile(bin_path) or os.path.islink(bin_path):
+            return False
+        if not stat.S_ISREG(os.lstat(bin_path).st_mode):
+            return False
+        res = subprocess.run(
+            ["/usr/bin/codesign", "--verify", "--strict", "-R", GOOGLE_SIGNING_REQ, bin_path],
+            capture_output=True,
+            timeout=15,
+            check=False,
+        )
+        return res.returncode == 0
+    except Exception:
+        return False
+
+
 def _probe_agy_version_str(bin_path: str, allow_chmod: bool = False) -> str | None:
-    """Runs `<agy> --version` safely and returns the raw version line if valid."""
-    if not os.path.isfile(bin_path):
+    """在确认具备 Google 官方签名后安全执行 `<agy> --version`（若为 sudo 态则自动降权运行）。"""
+    if not _is_trusted_agy_binary(bin_path):
         return None
     orig_mode = None
     try:
@@ -1458,13 +1505,18 @@ def _probe_agy_version_str(bin_path: str, allow_chmod: bool = False) -> str | No
                 return None
             orig_mode = stat.S_IMODE(st.st_mode)
             os.chmod(bin_path, orig_mode | stat.S_IXUSR)
-        res = subprocess.run(
-            [bin_path, "--version"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-        )
+        run_kwargs: dict = {
+            "capture_output": True,
+            "text": True,
+            "timeout": 5,
+            "check": False,
+        }
+        if os.geteuid() == 0 and "user" in inspect.signature(subprocess.Popen.__init__).parameters:
+            uid, gid, _ = get_real_user_info()
+            if uid != 0:
+                run_kwargs["user"] = uid
+                run_kwargs["group"] = gid
+        res = subprocess.run([bin_path, "--version"], **run_kwargs)
         if res.returncode == 0:
             raw = (res.stdout or "").strip()
             if _parse_semver(raw) is not None:
@@ -1495,19 +1547,21 @@ def _get_cached_orig_ver(backup_dir: str, orig_path: str, orig_sha: str, readonl
 
 
 def _get_cached_local_agy_ver(backup_dir: str, local_agy: str, readonly: bool) -> str | None:
-    if not os.path.isfile(local_agy):
+    if not os.path.isfile(local_agy) or os.path.islink(local_agy):
         return None
     try:
-        st = os.stat(local_agy)
+        st = os.lstat(local_agy)
     except OSError:
         return None
-    sig = f"{st.st_size}:{getattr(st, 'st_mtime_ns', int(st.st_mtime))}"
+    sig = _file_stat_sig(st)
     cache = _load_gemini_ver_cache(backup_dir)
     entry = cache.get("local")
     if isinstance(entry, dict) and entry.get("stat") == sig and entry.get("version"):
         return str(entry["version"])
+    if readonly:
+        return None
     ver_str = _probe_agy_version_str(local_agy, allow_chmod=False)
-    if ver_str and not readonly:
+    if ver_str:
         cache["local"] = {"stat": sig, "version": ver_str}
         _save_gemini_ver_cache(backup_dir, cache)
     return ver_str
@@ -1523,7 +1577,7 @@ def _select_gemini_base_binary(
 ) -> tuple[str, str | None, str | None, str | None]:
     """
     Selects the newest valid official base binary for Gemini.app/Contents/Helpers/agy:
-      - Upgrades to ~/.local/bin/agy ONLY when it exists, is executable, unpatched, and has strictly newer semver than orig.
+      - Upgrades to ~/.local/bin/agy ONLY when it exists, is executable, unpatched, vendor-signed, and strictly newer than orig.
       - Never downgrades; falls back cleanly to ~/.antigravity-zh/backup/gemini_agy.orig when absent or older/equal.
     Returns: (base_path, base_sha256_or_None, orig_ver_str, base_ver_str)
     """
@@ -1538,8 +1592,11 @@ def _select_gemini_base_binary(
     if (
         local_ver is not None
         and os.path.isfile(local_agy)
+        and not os.path.islink(local_agy)
         and os.access(local_agy, os.X_OK)
-        and (orig_ver is None or local_ver > orig_ver)
+        and orig_ver is not None
+        and local_ver > orig_ver
+        and (readonly or _is_trusted_agy_binary(local_agy))
     ):
         try:
             st = os.lstat(local_agy)
@@ -1580,6 +1637,9 @@ def _is_agy_already_patched_bytes(data: bytes) -> bool:
         SHARED_BUNDLE_REL_URL.encode("utf-8") in data
         or LEGACY_SHARED_BUNDLE_REL_URL.encode("utf-8") in data
         or b"ag-zh-bundle.js" in data
+        or NEW_TITLE_PROMPT_626 in data
+        or NEW_TITLE_PROMPT_522 in data
+        or NEW_TITLE_PROMPT in data
     )
 
 
@@ -1588,7 +1648,7 @@ def ensure_and_patch_gemini_agy(home_dir: str, force: bool = False) -> bool:
     Safely patches /Applications/Gemini.app/Contents/Helpers/agy:
       0. Verifies Gemini.app has passed macOS first-launch Gatekeeper check before touching it.
       1. Preserves Gemini.app's official built-in binary strictly out-of-bundle in ~/.antigravity-zh/backup/gemini_agy.orig.
-      2. Uses ~/.local/bin/agy as the patch base ONLY if it is strictly newer than gemini_agy.orig (never downgrades).
+      2. Uses ~/.local/bin/agy as the patch base ONLY if it is vendor-signed and strictly newer than gemini_agy.orig.
       3. Preserves original code-signing identifier (`agy`) and entitlements on the single binary without touching MacOS/Gemini.
     """
     if not os.path.isfile(GEMINI_AGY_BIN):
@@ -1607,7 +1667,7 @@ def ensure_and_patch_gemini_agy(home_dir: str, force: bool = False) -> bool:
     if not os.path.isfile(gemini_agy_orig) and os.path.isfile(LEGACY_GEMINI_AGY_ORIG) and not os.path.islink(LEGACY_GEMINI_AGY_ORIG):
         with open(LEGACY_GEMINI_AGY_ORIG, "rb") as lf:
             legacy_bytes = lf.read()
-        if not _is_agy_already_patched_bytes(legacy_bytes):
+        if not _is_agy_already_patched_bytes(legacy_bytes) and _is_trusted_agy_binary(LEGACY_GEMINI_AGY_ORIG):
             _write_exclusive_atomic(gemini_agy_orig, legacy_bytes, 0o600, dir_mode=0o700)
 
     for legacy_f in (
@@ -1641,12 +1701,12 @@ def ensure_and_patch_gemini_agy(home_dir: str, force: bool = False) -> bool:
     ):
         with open(GEMINI_AGY_BIN, "rb") as f:
             live_data = f.read()
-        if not _is_agy_already_patched_bytes(live_data):
+        if not _is_agy_already_patched_bytes(live_data) and _is_trusted_agy_binary(GEMINI_AGY_BIN):
             log(f"正在备份 Gemini.app 官方原版 Helpers/agy -> {gemini_agy_orig} ...")
             _write_exclusive_atomic(gemini_agy_orig, live_data, 0o600, dir_mode=0o700)
 
-    if not os.path.isfile(gemini_agy_orig):
-        log(f"警告: 未找到 {gemini_agy_orig} 备份文件，跳过 Gemini.app 内置 agy 补丁")
+    if not os.path.isfile(gemini_agy_orig) or not _is_trusted_agy_binary(gemini_agy_orig):
+        log(f"警告: 未找到通过官方签名校验的 {gemini_agy_orig} 备份，跳过 Gemini.app 内置 agy 补丁")
         return False
 
     orig_sha = compute_sha256(gemini_agy_orig)
@@ -1654,8 +1714,10 @@ def ensure_and_patch_gemini_agy(home_dir: str, force: bool = False) -> bool:
     base_path, base_sha, orig_ver_str, base_ver_str = _select_gemini_base_binary(
         home_dir, gemini_agy_orig, orig_sha, readonly=False, stat_cache=stat_cache
     )
+    ver_cache = _load_gemini_ver_cache(backup_dir)
     need_patch = (
         force
+        or ver_cache.get("patch_revision") != GEMINI_BINARY_PATCH_REVISION
         or recorded_orig_sha != orig_sha
         or recorded_base_sha != base_sha
         or recorded_patched_sha != live_sha
@@ -1699,6 +1761,9 @@ def ensure_and_patch_gemini_agy(home_dir: str, force: bool = False) -> bool:
             0o600,
             dir_mode=0o700,
         )
+        ver_cache = _load_gemini_ver_cache(backup_dir)
+        ver_cache["patch_revision"] = GEMINI_BINARY_PATCH_REVISION
+        _save_gemini_ver_cache(backup_dir, ver_cache)
         _record_stat_cache(stat_cache, gemini_agy_orig, orig_sha)
         _record_stat_cache(stat_cache, GEMINI_AGY_BIN, patched_sha)
         _save_guard_stat_cache(home_dir, stat_cache)
@@ -1880,20 +1945,32 @@ def _is_guard_up_to_date(home_dir: str) -> bool:
                 if not os.path.isfile(LS_SHA256_STATE_FILE):
                     return False
                 with open(LS_SHA256_STATE_FILE, "r", encoding="utf-8") as f:
-                    recorded_ls_sha, recorded_ls_status = _parse_ls_sha_state(f.read())
+                    recorded_ls_sha, recorded_ls_status, recorded_ls_patched_sha = _parse_ls_sha_state(f.read())
                 if (
                     not recorded_ls_sha
                     or _fast_sha256_for_guard(LS_ORIG_BIN, stat_cache, cache_state) != recorded_ls_sha
                 ):
                     return False
-                if recorded_ls_status == "patched" and not os.path.isfile(LS_ZH_BIN):
+                if recorded_ls_status == "patched":
+                    if (
+                        not recorded_ls_patched_sha
+                        or not os.path.isfile(LS_ZH_BIN)
+                        or _fast_sha256_for_guard(LS_ZH_BIN, stat_cache, cache_state) != recorded_ls_patched_sha
+                    ):
+                        return False
+                elif recorded_ls_status == "unmatched":
+                    if os.path.lexists(LS_ZH_BIN):
+                        return False
+                else:
                     return False
             if src_mtime > os.path.getmtime(preload_file) + 0.5:
                 return False
 
         if os.path.isfile(GEMINI_AGY_BIN) and has_passed_first_launch_gatekeeper(GEMINI_APP_PATH):
-            _, gemini_agy_orig, gemini_agy_sha_file = get_gemini_backup_paths(home_dir)
+            backup_dir, gemini_agy_orig, gemini_agy_sha_file = get_gemini_backup_paths(home_dir)
             if not os.path.isfile(gemini_agy_orig) or not os.path.isfile(gemini_agy_sha_file):
+                return False
+            if _load_gemini_ver_cache(backup_dir).get("patch_revision") != GEMINI_BINARY_PATCH_REVISION:
                 return False
             try:
                 with open(gemini_agy_sha_file, "r", encoding="utf-8") as f:
@@ -1946,6 +2023,7 @@ def sync_persist_runtime_files(home_dir: str) -> None:
         os.path.join(persist_dir, ".patcher.lock"),
         os.path.join(persist_dir, "guard.js"),
         os.path.join(persist_dir, "__pycache__"),
+        os.path.join(persist_backup_dir, "guard_manifest.json"),
     ):
         if os.path.isdir(stale_path) and not os.path.islink(stale_path):
             shutil.rmtree(stale_path, ignore_errors=True)
@@ -2011,11 +2089,12 @@ def install_update_guard() -> None:
         f"PYTHON_BIN={_sh_quote(real_python)}\n"
         f"PATCHER_PY={_sh_quote(persist_patcher)}\n"
         f"AG_HELPER={_sh_quote(ag_helper)}\n"
+        f"GOOGLE_REQ={_sh_quote(GOOGLE_SIGNING_REQ)}\n"
         "if [ ! -x \"$PYTHON_BIN\" ]; then\n"
         "  PYTHON_BIN=\"$(command -v python3 || echo /usr/bin/python3)\"\n"
         "fi\n"
         "\"$PYTHON_BIN\" \"$PATCHER_PY\" --guard-check >/dev/null 2>&1 && exit 0\n"
-        "if [ -x \"$AG_HELPER\" ]; then\n"
+        "if [ -x \"$AG_HELPER\" ] && /usr/bin/codesign --verify --strict -R \"$GOOGLE_REQ\" \"$AG_HELPER\" >/dev/null 2>&1; then\n"
         "  ELECTRON_RUN_AS_NODE=1 \"$AG_HELPER\" -e "
         "'const{spawnSync}=require(\"child_process\");"
         "const r=spawnSync(process.argv[1],[process.argv[2],\"--guard\"],{stdio:\"inherit\"});"

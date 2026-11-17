@@ -1024,7 +1024,11 @@
       fn: (m) => {
         const verb = m[1].toLowerCase() === 'during' ? '在' : '从';
         const suffix = m[1].toLowerCase() === 'during' ? '期间开始' : '开始';
-        const src = /subagent/i.test(m[2]) ? '子智能体对话' : /main/i.test(m[2]) ? '主对话' : m[2];
+        const src = /^the\s+subagent\s+conversation$/i.test(m[2])
+          ? '子智能体对话'
+          : /^the\s+main\s+conversation$/i.test(m[2])
+            ? '主对话'
+            : m[2];
         const baseStr = `${verb}${src}${suffix}`;
         if (!m[3]) return baseStr;
         const dest = /subagent/i.test(m[3]) ? '子智能体对话' : '主对话';
@@ -1767,8 +1771,23 @@
     return false;
   }
 
+  // 限制无上下文纯文本翻译缓存上限，避免流式输出时重复执行正则扫描
+  const stringCache = new Map();
+  const STRING_CACHE_LIMIT = 512;
+
   function translateString(raw) {
     if (!raw || typeof raw !== 'string') return null;
+    if (raw.length > 1200) return translateUncachedString(raw);
+    if (stringCache.has(raw)) return stringCache.get(raw);
+    const translated = translateUncachedString(raw);
+    if (stringCache.size >= STRING_CACHE_LIMIT) {
+      stringCache.delete(stringCache.keys().next().value);
+    }
+    stringCache.set(raw, translated);
+    return translated;
+  }
+
+  function translateUncachedString(raw) {
     const trimmed = raw.trim();
     if (shouldSkipText(trimmed)) return null;
 
@@ -1839,18 +1858,15 @@
       }
     }
 
-    // 5. Prefix rules (for long MCP/Skill descriptions and error notices)
+    // 5. 前缀规则：仅在完全相等或紧跟冒号分隔符时翻译前缀，绝不吞掉未知警告后缀
     for (let i = 0; i < FRAGMENTS.length; i++) {
       const [enFrag, zhFrag] = FRAGMENTS[i];
-      if (!enFrag) continue;
-      if (trimmed.startsWith(enFrag)) {
-        const rest = trimmed.slice(enFrag.length).trim();
-        if (rest.startsWith(':')) {
-          const detail = rest.slice(1).trim();
-          const zhBase = zhFrag.replace(/[。.:：]+$/, '');
-          return lead + (detail ? `${zhBase}：${detail}` : zhFrag) + trail;
-        }
-        return lead + zhFrag + trail;
+      if (!enFrag || !trimmed.startsWith(enFrag)) continue;
+      const rest = trimmed.slice(enFrag.length);
+      if (!rest) return lead + zhFrag + trail;
+      if (/^\s*[:：]/.test(rest)) {
+        const zhBase = zhFrag.replace(/[。.:：]+$/, '');
+        return lead + zhBase + rest + trail;
       }
     }
 
@@ -1875,7 +1891,7 @@
   const SUBTREE_REJECT_SELECTOR =
     'pre, code, kbd, samp, var, script, style, svg, ' +
     '.monaco-editor, .monaco-keybinding, .keybinding-label, .xterm, .cm-editor, .ProseMirror, ' +
-    '[contenteditable="true"], [data-lexical-editor], [data-lexical-text], [data-lexical-decorator], [data-lexical-beautiful-mention], ' +
+    '[data-lexical-editor], [data-lexical-text], [data-lexical-decorator], [data-lexical-beautiful-mention], ' +
     '[data-testid="file-title-name"], [data-testid="breadcrumb-segment"], [data-testid="branch-option"], ' +
     '[data-testid="fuzzy-match-highlight"], [data-testid="markdown-frontmatter"], [data-testid="terminal-surface"], ' +
     '[data-testid="sidecar-logs-content"], [data-testid="setup-script-output"], [data-testid="pdf-text-layer"], ' +
@@ -1894,30 +1910,47 @@
     'button, [role="button"], [role="menuitem"], .markdown-alert-title, ' +
     '[data-testid="markdown-table-copy-markdown"], [data-testid="markdown-table-width-toggle"], [data-testid="markdown-table-menu"]';
 
+  function parentElementOrHost(node) {
+    if (!node) return null;
+    if (node.parentElement) return node.parentElement;
+    const root = node.nodeType === 11 ? node : node.parentNode;
+    return root && root.host ? root.host : null;
+  }
+
+  function isElementSubtreeExcluded(el) {
+    if (EXCLUDED_TAGS.has(el.tagName) || el.matches(SUBTREE_REJECT_SELECTOR)) return true;
+    const editable = el.getAttribute('contenteditable');
+    if (editable !== null && /^(?:true|plaintext-only)?$/i.test(editable)) return true;
+    if ((el.getAttribute('translate') || '').toLowerCase() === 'no') return true;
+    // 未显式声明 value 属性的 option 改动文本会改变表单提交值，跳过以保数据语义稳定
+    return el.tagName === 'OPTION' && !el.hasAttribute('value');
+  }
+
   function isSubtreeExcluded(el) {
-    if (!el || el.nodeType !== 1) return false;
-    if (EXCLUDED_TAGS.has(el.tagName)) return true;
-    if (typeof el.closest === 'function' && el.closest(SUBTREE_REJECT_SELECTOR)) {
-      return true;
+    for (let p = el; p && p.nodeType === 1; p = parentElementOrHost(p)) {
+      if (isElementSubtreeExcluded(p)) return true;
+    }
+    return false;
+  }
+
+  function isContentExcluded(el, attributes) {
+    if (!el || el.nodeType !== 1) return true;
+    let insideChatUI = false;
+    let insideCodeControl = false;
+    for (let p = el; p; p = parentElementOrHost(p)) {
+      if (isElementSubtreeExcluded(p)) return true;
+      if (!attributes && p.tagName === 'TEXTAREA') return true;
+      // 外层按钮不得放行内部嵌套的聊天正文容器
+      if (p.matches(CHAT_PROSE_SELECTOR) && !insideChatUI) return true;
+      if (p.matches(CODE_LINE_SELECTOR) && (!attributes || !insideCodeControl)) return true;
+      if (p.matches(CHAT_UI_ALLOW_SELECTOR)) insideChatUI = true;
+      if (p.matches('button, [role="button"], [role="menuitem"]')) insideCodeControl = true;
     }
     return false;
   }
 
   function isTextParentExcluded(parent) {
-    if (!parent || parent.nodeType !== 1) return true;
-    if (parent.tagName === 'TEXTAREA') return true;
-    if (isSubtreeExcluded(parent)) return true;
-    if (typeof parent.closest === 'function') {
-      if (parent.closest(CODE_LINE_SELECTOR)) {
-        return true;
-      }
-      if (parent.closest(CHAT_PROSE_SELECTOR)) {
-        if (!parent.closest(CHAT_UI_ALLOW_SELECTOR)) {
-          return true;
-        }
-      }
-    }
-    return false;
+    return isContentExcluded(parent, false);
   }
 
   const textNodeCache = new WeakMap();
@@ -1934,13 +1967,7 @@
   ];
 
   function translateAttributes(el) {
-    if (!el || el.nodeType !== 1) return;
-    if (EXCLUDED_TAGS.has(el.tagName)) return;
-    // Skip attributes inside code editors or terminals
-    const inEditor =
-      typeof el.closest === 'function' &&
-      el.closest('pre, code, .monaco-editor, .xterm, .cm-editor, [data-testid="file-title-name"], [data-no-translate]');
-    if (inEditor) return;
+    if (isContentExcluded(el, true)) return;
 
     let cachedAttrs = attrNodeCache.get(el);
     for (let i = 0; i < TRANSLATABLE_ATTRS.length; i++) {
@@ -1950,12 +1977,12 @@
         if (!val) continue;
         if (cachedAttrs && ownLookup(cachedAttrs, attr) === val) continue;
         const translated = translateString(val);
+        if (!cachedAttrs) {
+          cachedAttrs = Object.create(null);
+          attrNodeCache.set(el, cachedAttrs);
+        }
+        cachedAttrs[attr] = translated || val;
         if (translated && translated !== val) {
-          if (!cachedAttrs) {
-            cachedAttrs = Object.create(null);
-            attrNodeCache.set(el, cachedAttrs);
-          }
-          cachedAttrs[attr] = translated;
           el.setAttribute(attr, translated);
         }
       }
@@ -1966,14 +1993,14 @@
   function getContextualTranslation(raw, parent) {
     const trimmed = raw.trim();
     if (!trimmed) return null;
-    if (
-      trimmed === 'Type' &&
-      typeof parent.closest === 'function' &&
-      parent.closest('[data-testid="plan-command-fyi-alert"]')
-    ) {
-      const lead = (raw.match(/^\s*/) || [''])[0];
-      const trail = (raw.match(/\s*$/) || [''])[0];
-      return lead + '输入' + trail;
+    if (trimmed === 'Type') {
+      for (let p = parent; p; p = parentElementOrHost(p)) {
+        if (p.matches('[data-testid="plan-command-fyi-alert"]')) {
+          const lead = (raw.match(/^\s*/) || [''])[0];
+          const trail = (raw.match(/\s*$/) || [''])[0];
+          return lead + '输入' + trail;
+        }
+      }
     }
     return null;
   }
@@ -2022,7 +2049,7 @@
     const val = node.nodeValue;
     if (!val || textNodeCache.get(node) === val) return;
 
-    const parent = node.parentElement;
+    const parent = parentElementOrHost(node);
     if (!parent || isTextParentExcluded(parent)) return;
 
     let translated = getContextualTranslation(val, parent);
@@ -2048,9 +2075,6 @@
         }
       }
       if (translated === val) return;
-      if (parent.tagName === 'OPTION' && !parent.hasAttribute('value')) {
-        parent.setAttribute('value', val.trim());
-      }
       textNodeCache.set(node, translated);
       node.nodeValue = translated;
     }
@@ -2062,10 +2086,7 @@
   const treeWalkerFilter = {
     acceptNode(node) {
       if (node.nodeType === 1) {
-        if (EXCLUDED_TAGS.has(node.tagName)) {
-          return NodeFilter.FILTER_REJECT;
-        }
-        if (typeof node.matches === 'function' && node.matches(SUBTREE_REJECT_SELECTOR)) {
+        if (isElementSubtreeExcluded(node)) {
           return NodeFilter.FILTER_REJECT;
         }
       } else if (node.nodeType === 3) {
@@ -2081,6 +2102,9 @@
     if (!root) return;
     if (root.nodeType === 3) {
       translateTextNode(root);
+      return;
+    }
+    if (root.nodeType === 11 && root.host && isSubtreeExcluded(root.host)) {
       return;
     }
     if (root.nodeType === 1) {
@@ -2113,42 +2137,41 @@
   }
 
   const pendingNodes = new Set();
+  const pendingAttributes = new Set();
   let rafScheduled = false;
+
+  function coveredByBatch(node, batch, includeSelf) {
+    // 合并同一批次遍历时兼顾 ShadowRoot 与其宿主节点
+    let p = includeSelf ? node : node.parentNode || node.host;
+    while (p) {
+      if (batch.has(p)) return true;
+      p = p.parentNode || p.host;
+    }
+    return false;
+  }
 
   function flushPending() {
     rafScheduled = false;
-    const batch = Array.from(pendingNodes);
-    const batchSet = new Set(batch);
+    const batch = new Set(pendingNodes);
+    const attributes = Array.from(pendingAttributes);
     pendingNodes.clear();
+    pendingAttributes.clear();
 
-    for (let i = 0; i < batch.length; i++) {
+    for (const node of batch) {
       try {
-        const node = batch[i];
-        const isShadow = typeof ShadowRoot !== 'undefined' && node instanceof ShadowRoot;
-        if (!node || (isShadow ? node.host && node.host.isConnected === false : node.isConnected === false)) {
-          continue;
-        }
-        // Skip if an ancestor of this node is also in the current batch
-        let ancestorInBatch = false;
-        let p = node.parentNode;
-        while (p) {
-          if (batchSet.has(p)) {
-            ancestorInBatch = true;
-            break;
-          }
-          p = p.parentNode;
-        }
-        if (!ancestorInBatch) {
-          walkAndTranslate(node);
-        }
+        if (node.isConnected === false || coveredByBatch(node, batch, false)) continue;
+        walkAndTranslate(node);
+      } catch (_) {}
+    }
+    for (const el of attributes) {
+      try {
+        if (el.isConnected === false || coveredByBatch(el, batch, true)) continue;
+        translateAttributes(el);
       } catch (_) {}
     }
   }
 
-  function scheduleTranslate(node) {
-    if (!node) return;
-    if (node.nodeType === 1 && isSubtreeExcluded(node)) return;
-    pendingNodes.add(node);
+  function scheduleFlush() {
     if (!rafScheduled) {
       rafScheduled = true;
       if (typeof requestAnimationFrame === 'function') {
@@ -2157,6 +2180,12 @@
         setTimeout(flushPending, 16);
       }
     }
+  }
+
+  function scheduleTranslate(node) {
+    if (!node || (node.nodeType !== 1 && node.nodeType !== 3 && node.nodeType !== 11)) return;
+    pendingNodes.add(node);
+    scheduleFlush();
   }
 
   function observeRoot(rootNode) {
@@ -2168,17 +2197,16 @@
         for (let i = 0; i < mutations.length; i++) {
           const m = mutations[i];
           if (m.type === 'characterData') {
-            translateTextNode(m.target);
+            if (textNodeCache.get(m.target) !== m.target.nodeValue) scheduleTranslate(m.target);
           } else if (m.type === 'attributes') {
-            translateAttributes(m.target);
+            const cached = attrNodeCache.get(m.target);
+            if (!cached || ownLookup(cached, m.attributeName) !== m.target.getAttribute(m.attributeName)) {
+              pendingAttributes.add(m.target);
+              scheduleFlush();
+            }
           } else if (m.type === 'childList') {
             for (let j = 0; j < m.addedNodes.length; j++) {
-              const added = m.addedNodes[j];
-              if (added.nodeType === 3) {
-                translateTextNode(added);
-              } else if (added.nodeType === 1) {
-                scheduleTranslate(added);
-              }
+              scheduleTranslate(m.addedNodes[j]);
             }
           }
         }
@@ -2192,6 +2220,35 @@
       attributes: true,
       attributeFilter: TRANSLATABLE_ATTRS,
     });
+  }
+
+  // 监听空闲后动态挂载的开放式 Shadow DOM，消除延迟 attachShadow 漏译死角
+  function installAttachShadowHook() {
+    try {
+      const proto = typeof Element !== 'undefined' ? Element.prototype : null;
+      if (!proto || typeof proto.attachShadow !== 'function' || proto.__agZhShadowPatched) return;
+      const origAttachShadow = proto.attachShadow;
+      Object.defineProperty(proto, 'attachShadow', {
+        configurable: true,
+        writable: true,
+        value: function () {
+          const shadow = origAttachShadow.apply(this, arguments);
+          try {
+            if (shadow && shadow.mode === 'open') {
+              observeRoot(shadow);
+              scheduleTranslate(shadow);
+            }
+          } catch (_) {}
+          return shadow;
+        },
+      });
+      Object.defineProperty(proto, '__agZhShadowPatched', {
+        value: true,
+        configurable: true,
+        enumerable: false,
+        writable: false,
+      });
+    } catch (_) {}
   }
 
   function startEngine() {
@@ -2224,7 +2281,7 @@
   function installWebKitThumbCompressionFallback() {
     try {
       const ua = typeof navigator !== 'undefined' && navigator.userAgent ? navigator.userAgent : '';
-      if (!ua || /Chrome|Chromium|Electron|Firefox/i.test(ua)) return;
+      if (!/AppleWebKit/i.test(ua) || /Chrome|Chromium|CriOS|Edg|OPR|Electron|Firefox|FxiOS/i.test(ua)) return;
       const proto = typeof HTMLCanvasElement !== 'undefined' ? HTMLCanvasElement.prototype : null;
       if (!proto || typeof proto.toDataURL !== 'function' || proto.__agZhThumbPatched) return;
 
@@ -2238,7 +2295,8 @@
           if (
             typeof type !== 'string' ||
             type.toLowerCase() !== 'image/jpeg' ||
-            typeof quality !== 'number' ||
+            !Number.isFinite(quality) ||
+            quality < 0 ||
             quality > 0.03 ||
             res.length <= MAX_THUMB_DATAURL_LEN
           ) {
@@ -2284,6 +2342,7 @@
     } catch (_) {}
   }
 
+  installAttachShadowHook();
   installWebKitThumbCompressionFallback();
 
   if (document.readyState === 'loading') {

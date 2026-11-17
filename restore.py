@@ -11,9 +11,11 @@ from __future__ import annotations
 import argparse
 import fcntl
 import glob
+import json
 import os
 import shutil
 import stat
+import struct
 import subprocess
 import sys
 import time
@@ -39,6 +41,44 @@ LEGACY_GEMINI_AGY_STAGING = os.path.join(GEMINI_HELPERS_DIR, ".agy.staging")
 LEGACY_GEMINI_AGY_SHA256_STATE_FILE = os.path.join(GEMINI_HELPERS_DIR, ".zh_agy_sha256")
 
 LAUNCH_AGENT_LABEL = "com.antigravity.zh-cn"
+GOOGLE_SIGNING_REQ = '=anchor apple generic and certificate leaf[subject.OU] = "EQHXZ8M8AV"'
+
+
+def _is_valid_asar(asar_path: str) -> bool:
+    """校验待还原的 ASAR 归档头部结构是否完整。"""
+    try:
+        if not os.path.isfile(asar_path) or os.path.islink(asar_path):
+            return False
+        file_size = os.path.getsize(asar_path)
+        if file_size < 16:
+            return False
+        with open(asar_path, "rb") as f:
+            header_data = f.read(16)
+            _, header_total_size, _, header_json_len = struct.unpack("<IIII", header_data)
+            if file_size < 8 + header_total_size or header_json_len <= 0 or header_json_len > 64 * 1024 * 1024:
+                return False
+            header = json.loads(f.read(header_json_len).decode("utf-8"))
+        return isinstance(header, dict) and "files" in header
+    except Exception:
+        return False
+
+
+def _is_trusted_agy_binary(bin_path: str) -> bool:
+    """校验待还原的 Helpers/agy 备份是否具备有效 Google 官方签名。"""
+    try:
+        if not os.path.isfile(bin_path) or os.path.islink(bin_path):
+            return False
+        if not stat.S_ISREG(os.lstat(bin_path).st_mode):
+            return False
+        res = subprocess.run(
+            ["/usr/bin/codesign", "--verify", "--strict", "-R", GOOGLE_SIGNING_REQ, bin_path],
+            capture_output=True,
+            timeout=15,
+            check=False,
+        )
+        return res.returncode == 0
+    except Exception:
+        return False
 
 
 def get_real_user_info() -> tuple[int, int, str]:
@@ -138,12 +178,14 @@ def restore_antigravity_app(uid: int, gid: int) -> None:
         return
 
     if os.path.isfile(ASAR_DISABLED):
-        if os.path.isfile(ASAR_FILE):
+        if os.path.isfile(ASAR_FILE) and _is_valid_asar(ASAR_FILE):
             print("检测到 app.asar 与 app.asar.disabled 共存，保留官方 app.asar 并移除冗余 .disabled。")
             os.remove(ASAR_DISABLED)
         else:
+            if not _is_valid_asar(ASAR_DISABLED):
+                raise ValueError(f"安全拦截：原版归档 {ASAR_DISABLED} 校验不完整，中止还原以保护当前应用")
             print("正在恢复原始 app.asar...")
-            os.rename(ASAR_DISABLED, ASAR_FILE)
+            os.replace(ASAR_DISABLED, ASAR_FILE)
         if os.geteuid() == 0 and uid != 0 and os.path.exists(ASAR_FILE):
             os.chown(ASAR_FILE, uid, gid)
 
@@ -170,7 +212,7 @@ def restore_gemini_agy(uid: int, gid: int, home_dir: str) -> bool:
     persist_orig = os.path.join(home_dir, ".antigravity-zh", "backup", "gemini_agy.orig")
     backup_src = None
     for candidate in (persist_orig, LEGACY_GEMINI_AGY_ORIG):
-        if os.path.isfile(candidate) and not os.path.islink(candidate):
+        if _is_trusted_agy_binary(candidate):
             backup_src = candidate
             break
 
