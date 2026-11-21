@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Antigravity v2.15+ / v2.31+ & Gemini.app Dual-End Chinese Localization Patcher & Guard
+Antigravity v2.15+ / v2.34+ & Gemini.app Dual-End Chinese Localization Patcher & Guard
 Architecture & Security Guarantees:
-  - Atomic staging extraction (Resources/app.staging -> Resources/app) so crashes never corrupt the app
+  - Atomic staging extraction (Resources/app.staging -> Resources/app with app.old rollback) so crashes never corrupt the app
   - Partial-write detection & retry loop for app.asar during official updates
   - Path-traversal & symlink-escape protection (ASAR-Slip defense)
   - SHA256 version tracking (.zh_asar_sha256, .zh_ls_sha256, ~/.antigravity-zh/backup/gemini_agy.sha256)
@@ -45,6 +45,7 @@ ASAR_DISABLED = os.path.join(RESOURCES_DIR, "app.asar.disabled")
 ASAR_UNPACKED_EXTRAS = os.path.join(RESOURCES_DIR, "app.asar.unpacked")
 UNPACKED_APP_DIR = os.path.join(RESOURCES_DIR, "app")
 STAGING_APP_DIR = os.path.join(RESOURCES_DIR, "app.staging")
+BACKUP_APP_DIR = os.path.join(RESOURCES_DIR, "app.old")
 SHA256_STATE_FILE = os.path.join(RESOURCES_DIR, ".zh_asar_sha256")
 
 BIN_DIR = os.path.join(RESOURCES_DIR, "bin")
@@ -122,14 +123,23 @@ NEW_TITLE_PROMPT_626 = _NEW_TITLE_PROMPT_626_RAW + b" " * (
 )
 
 NEW_INDEX_HTML_LOADER = (
-    b"\n;(function(){function load(){try{var c=window.__APP_CONFIG__;if(!c)return;"
-    b"var s=document.createElement('script');"
-    b"s.src='/static/artifacts/.antigravity-zh/ag-zh.js?csrf='+encodeURIComponent(c.csrfToken||'');"
-    b"document.head.appendChild(s)}catch(e){}}"
-    b"if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',load,{once:true});else load()})();"
+    b"\n;(function(){var tries=0,n=0,busy=0,bad=Object.create(null);"
+    b"function tok(){var l=[];"
+    b"try{var c=window.__APP_CONFIG__;if(c&&c.csrfToken)l.push(String(c.csrfToken))}catch(e){}"
+    b"try{var v=localStorage.getItem('agy_session_csrf_token');if(v)l.push(v)}catch(e){}"
+    b"try{var m=document.cookie.match(/(?:^|;\\s*)csrfToken=([^;]+)/);if(m&&m[1])l.push(decodeURIComponent(m[1]))}catch(e){}"
+    b"for(var i=0;i<l.length;i++){if(l[i]&&!bad[l[i]])return l[i]}return ''}"
+    b"function go(){if(window.__AG_ZH_ENGINE_LOADED__||tries>=5||n++>150)return;"
+    b"if(busy)return;var t=tok();if(!t){setTimeout(go,80);return}"
+    b"busy=1;tries++;var s=document.createElement('script');"
+    b"s.src='/static/artifacts/.antigravity-zh/ag-zh.js?csrf='+encodeURIComponent(t);"
+    b"s.onload=function(){busy=0;if(!window.__AG_ZH_ENGINE_LOADED__){bad[t]=1;setTimeout(go,80)}};"
+    b"s.onerror=function(){busy=0;bad[t]=1;try{s.remove()}catch(e){}setTimeout(go,80)};"
+    b"(document.head||document.documentElement).appendChild(s)}"
+    b"if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',go,{once:true});else go()})();"
 )
 
-GEMINI_BINARY_PATCH_REVISION = 2
+GEMINI_BINARY_PATCH_REVISION = 3
 GOOGLE_SIGNING_REQ = '=anchor apple generic and certificate leaf[subject.OU] = "EQHXZ8M8AV"'
 LAUNCH_AGENT_LABEL = "com.antigravity.zh-cn"
 
@@ -169,7 +179,7 @@ FALLBACK_MENU_MAP = {
     "Zoom In": "放大",
     "Zoom Out": "缩小",
     "Toggle Full Screen": "切换全屏",
-    "Docs": "文档",
+    "Docs": "官方文档",
     "Connect to WSL": "连接到 WSL",
     "Reopen Locally": "在本地重新打开",
     "Speech": "语音",
@@ -518,7 +528,7 @@ def patch_preload(dist_dir: str, locale_data: dict, engine_code: str) -> None:
         content = strip_existing_patch_block(f.read())
 
     frontend_locale = {
-        "version": locale_data.get("version", "2.31.2"),
+        "version": locale_data.get("version", "2.34.0"),
         "exact": locale_data.get("exact", {}),
         "fragments": locale_data.get("fragments", []),
     }
@@ -559,8 +569,8 @@ def patch_updater(dist_dir: str) -> None:
         f"{PATCH_START_MARKER}\n"
         "exports.updateActions['Check for Updates'] = () => checkForUpdates(true);\n"
         "exports.updateActions['检查更新'] = () => checkForUpdates(true);\n"
-        "exports.updateActions['Restart to Update'] = () => quitAndInstall();\n"
-        "exports.updateActions['重启以应用更新'] = () => quitAndInstall();\n"
+        "exports.updateActions['Restart to Update'] = () => void quitAndInstall();\n"
+        "exports.updateActions['重启以应用更新'] = () => void quitAndInstall();\n"
         f"{PATCH_END_MARKER}\n"
     )
     content = content.rstrip() + "\n" + alias_block
@@ -582,7 +592,6 @@ def patch_menu(dist_dir: str, menu_dict: dict) -> None:
         merged_menu.update(menu_dict)
 
     content = content.replace("label: 'New Window'", "label: '新建窗口'")
-    content = content.replace("label: 'Docs'", "label: '文档'")
     content = content.replace("label: 'Connect to WSL'", "label: '连接到 WSL'")
     content = content.replace("label: 'Reopen Locally'", "label: '在本地重新打开'")
     content = content.replace("label: 'Zoom In'", "label: '放大'")
@@ -601,12 +610,12 @@ def patch_menu(dist_dir: str, menu_dict: dict) -> None:
         "services": "服务",
         "hide": "隐藏 Antigravity",
         "hideothers": "隐藏其他",
-        "unhide": "全部显示",
+        "unhide": "显示全部",
         "quit": "退出 Antigravity",
         "undo": "撤销",
         "redo": "重做",
         "cut": "剪切",
-        "copy": "拷贝",
+        "copy": "复制",
         "paste": "粘贴",
         "pasteandmatchstyle": "粘贴并匹配样式",
         "delete": "删除",
@@ -617,11 +626,11 @@ def patch_menu(dist_dir: str, menu_dict: dict) -> None:
         "resetzoom": "实际大小",
         "zoomin": "放大",
         "zoomout": "缩小",
-        "togglefullscreen": "进入全屏幕",
+        "togglefullscreen": "切换全屏",
         "minimize": "最小化",
         "zoom": "缩放",
         "front": "前置全部窗口",
-        "close": "关闭窗口",
+        "close": "关闭",
         "window": "窗口",
         "help": "帮助",
         "editmenu": "编辑",
@@ -874,6 +883,10 @@ def patch_webview_popup_security(dist_dir: str) -> None:
         ("label: 'Connection info…'", "label: '连接信息…'"),
         ("title: 'Connection info'", "title: '连接信息'"),
         ("buttons: ['OK']", "buttons: ['确定']"),
+        ("{ role: 'cut', enabled: canCut },", "{ role: 'cut', label: '剪切', enabled: canCut },"),
+        ("{ role: 'copy', enabled: canCopy },", "{ role: 'copy', label: '复制', enabled: canCopy },"),
+        ("{ role: 'paste', enabled: canPaste },", "{ role: 'paste', label: '粘贴', enabled: canPaste },"),
+        ("{ role: 'selectAll', enabled: canSelectAll },", "{ role: 'selectAll', label: '全选', enabled: canSelectAll },"),
     ]
     _apply_replacements(sec_path, replacements, "已汉化内置浏览器安全信息弹窗 -> dist/webviewPopupSecurity.js")
 
@@ -913,6 +926,7 @@ def patch_webauthn_and_cable(dist_dir: str) -> None:
     _apply_replacements(
         cable_path,
         [
+            ('<html lang="en">', '<html lang="zh-CN">'),
             ("<title>Passkeys</title>", "<title>通行密钥</title>"),
             ('<h1 class="sheet-title">Passkeys</h1>', '<h1 class="sheet-title">通行密钥</h1>'),
             ('<p class="mechanism-header">Use your phone or tablet</p>', '<p class="mechanism-header">使用您的手机或平板电脑</p>'),
@@ -922,6 +936,8 @@ def patch_webauthn_and_cable(dist_dir: str) -> None:
             ),
             (">Cancel</button>", ">取消</button>"),
             ("title: 'Passkeys'", "title: '通行密钥'"),
+            ("modal?.updateStatus('Connecting to your device…');", "modal?.updateStatus('正在连接到您的设备…');"),
+            ("modal?.updateStatus('Verify on your device to continue…');", "modal?.updateStatus('请在您的设备上验证以继续…');"),
         ],
         "已汉化跨设备通行密钥弹窗 -> dist/cablev2.js",
     )
@@ -968,6 +984,480 @@ def patch_wsl(dist_dir: str) -> None:
         ),
     ]
     _apply_replacements(wsl_path, replacements, "已汉化 WSL 路径与安装状态提示 -> dist/wsl.js")
+
+
+def patch_remote_ssh(dist_dir: str) -> None:
+    """汉化 v2.34.0 新增的 SSH 远程连接页面、原生对话框、凭据弹窗与错误提示 -> dist/remote/*.js"""
+    remote_dir = os.path.join(dist_dir, "remote")
+    if not os.path.isdir(remote_dir):
+        return
+
+    _apply_replacements(
+        os.path.join(remote_dir, "disconnectedPage.js"),
+        [
+            ("reconnect: 'Reconnect',", "reconnect: '重新连接',"),
+            ("stop: 'Stop Server',", "stop: '停止服务器',"),
+            ("close: 'Close',", "close: '关闭',"),
+            ("? 'Restarting…'", "? '正在重启…'"),
+            ("? 'Reconnecting…'", "? '正在重新连接…'"),
+            (": 'Disconnected';", ": '已断开连接';"),
+            ("? `Restarting the Antigravity server on ${host}…`", "? `正在重启 ${host} 上的 Antigravity 服务器…`"),
+            ("? `Reconnecting to ${host}…`", "? `正在重新连接到 ${host}…`"),
+            (": `Disconnected from ${host}`;", ": `已与 ${host} 断开连接`;"),
+            (
+                "? 'This window opens it again once it has started.'",
+                "? '服务器启动后，此窗口将自动重新打开。'",
+            ),
+            (
+                "? `Its server on ${host} stopped, and its agents with it.`",
+                "? `${host} 上的服务器已停止，运行中的智能体也已随之停止。`",
+            ),
+            (": `Agents keep running on ${host}.`", ": `智能体仍在 ${host} 上继续运行。`"),
+            (
+                "? `Its agents on ${host} stopped with it.`",
+                "? `${host} 上的智能体已随之停止。`",
+            ),
+            (
+                ": `Agents keep running on ${host} unless its server stopped.`;",
+                ": `除非服务器停止，否则智能体仍会在 ${host} 上继续运行。`;",
+            ),
+            ('<html lang="en">', '<html lang="zh-CN">'),
+        ],
+        "已汉化 SSH 断线/重连页面 -> dist/remote/disconnectedPage.js",
+    )
+
+    _apply_replacements(
+        os.path.join(remote_dir, "remoteManager.js"),
+        [
+            ("title: 'Choose an SSH config file',", "title: '选择 SSH 配置文件',"),
+            (
+                "detail: `${problem.why[0].toUpperCase()}${problem.why.slice(1)}. ${problem.fix}`,",
+                "detail: `${problem.why[0].toUpperCase()}${problem.why.slice(1)}。${problem.fix}`,",
+            ),
+            (
+                "message: `${name} can't be the SSH config file`,",
+                "message: `${name} 不能用作 SSH 配置文件`,",
+            ),
+            ("title: 'Choose another SSH config file',", "title: '选择其他 SSH 配置文件',"),
+            ("buttons: ['Choose Another File…', 'Cancel'],", "buttons: ['选择其他文件…', '取消'],"),
+            ("title: 'SSH connection failed',", "title: 'SSH 连接失败',"),
+            ("this.reportError(err, entry.label, 'Sign-in failed', win);", "this.reportError(err, entry.label, '登录失败', win);"),
+            ("title: 'Could not restart the SSH server',", "title: '无法重启 SSH 服务器',"),
+            (
+                "message: `${entry.label} still runs Antigravity server ${running}.`,",
+                "message: `${entry.label} 仍在运行 Antigravity 服务器 ${running}。`,",
+            ),
+            ("buttons: ['Stop Server', 'Cancel'],", "buttons: ['停止服务器', '取消'],"),
+            ("title: 'Stop SSH server',", "title: '停止 SSH 服务器',"),
+            (
+                "message: `Stop the Antigravity server on ${entry.label}?`,",
+                "message: `确定要停止 ${entry.label} 上的 Antigravity 服务器吗？`,",
+            ),
+            (
+                "detail: 'Agents running on this host will stop and its window will close. ' +\n"
+                "                        'The server starts again the next time you connect.',",
+                "detail: '此主机上正在运行的智能体将会停止，其窗口也会关闭。下次连接时服务器将自动重新启动。',",
+            ),
+            (
+                "this.reportError(err, entry.label, 'Could not stop the SSH server', win);",
+                "this.reportError(err, entry.label, '无法停止 SSH 服务器', win);",
+            ),
+            ("message: `Not connected to ${label}`,", "message: `尚未连接到 ${label}`,",),
+            (
+                "detail: 'Reconnect first, then stop its server.',",
+                "detail: '请先重新连接，再停止其服务器。',",
+            ),
+            ("buttons: ['Allow', \"Don't Allow\"],", "buttons: ['允许', '不允许'],"),
+            ("title: 'Microphone access',", "title: '麦克风访问权限',"),
+            (
+                "message: `Allow ${label} to use your microphone?`,",
+                "message: `允许 ${label} 使用您的麦克风吗？`,",
+            ),
+            (
+                "detail: `The page in this window comes from ${label}. If you allow it, that ` +\n"
+                "                \"host can use this computer's microphone for voice whenever one of \" +\n"
+                "                'its windows is open. Antigravity asks again after you quit it.',",
+                "detail: `此窗口中的页面来自 ${label}。如果允许，只要打开该主机的任意窗口，该主机即可使用此电脑的麦克风进行语音交互。退出 Antigravity 后下次将重新询问。`,",
+            ),
+            ("buttons: ['Sign In', 'Cancel'],", "buttons: ['登录', '取消'],"),
+            ("title: 'Sign in',", "title: '登录',"),
+            (
+                "message: `Sign in to your organization for ${entry.label}?`,",
+                "message: `要为 ${entry.label} 登录您的组织账号吗？`,",
+            ),
+            (
+                "detail: 'Continue only if you just chose to sign in with your organization ' +\n"
+                "                `in this window. ${entry.label} will get access to your ` +\n"
+                "                \"organization's Google Cloud account.\\n\" +\n"
+                "                (names\n"
+                "                    ? `Workforce pool: ${names[1]}  Provider: ${names[2]}`\n"
+                "                    : `Identity provider: ${provider}`),",
+                "detail: `仅当您刚刚在此窗口选择了组织登录时才继续。${entry.label} 将获得您组织的 Google Cloud 账号访问权限。\\n` +\n"
+                "                (names\n"
+                "                    ? `员工身份池：${names[1]}  提供方：${names[2]}`\n"
+                "                    : `身份提供方：${provider}`),",
+            ),
+            ("buttons: ['Continue', 'Cancel'],", "buttons: ['继续', '取消'],"),
+            (
+                "message: `Finish this sign-in on ${entry.label}?`,",
+                "message: `要在 ${entry.label} 上完成此次登录吗？`,",
+            ),
+            (
+                "detail: `Continue only if you just chose to sign in from the ${entry.label} ` +\n"
+                "                'window. Your browser opens the sign-in page; once you sign in, ' +\n"
+                "                `${entry.label} gets access to that account.\\n` +\n"
+                "                `Sign-in page: ${(0, types_1.sanitizeRemoteText)(new URL(origin).host, 200)}`,",
+                "detail: `仅当您刚刚在 ${entry.label} 窗口中选择了登录时才继续。浏览器将打开登录页面；完成登录后，${entry.label} 将获得该账号的访问权限。\\n` +\n"
+                "                `登录页面：${(0, types_1.sanitizeRemoteText)(new URL(origin).host, 200)}`,",
+            ),
+            ("buttons: ['Take Over', 'Cancel'],", "buttons: ['接管', '取消'],"),
+            ("title: 'Shared home directory',", "title: '共享主目录',"),
+            (
+                "? `This window's Antigravity server runs on ${host}, another machine that shares your home directory.`",
+                "? `此窗口的 Antigravity 服务器正运行在共享主目录的另一台主机 ${host} 上。`",
+            ),
+            (
+                "? `Your Antigravity server runs on ${host}, another machine that shares your home directory.`",
+                "? `您的 Antigravity 服务器正运行在共享主目录的另一台主机 ${host} 上。`",
+            ),
+            (
+                ": `${host}, another machine that shares your home directory, started your Antigravity server.`,",
+                ": `共享主目录的另一台主机 ${host} 启动了您的 Antigravity 服务器。`,",
+            ),
+            (
+                "? `${label} reached ${here} this time. Cancel and reconnect to try again for ${host}, or take over to stop the server on ${host}, and its agents, and run it on ${here} instead.`",
+                "? `本次 ${label} 连接到了 ${here}。您可以取消并重新连接以重试 ${host}，或选择“接管”以停止 ${host} 上的服务器及智能体，改在 ${here} 上运行。`",
+            ),
+            (
+                "? `${label} reached ${here}. Take over to stop the server on ${host}, and its agents, and run it on ${here} instead. To keep it running, connect to ${host}.`",
+                "? `${label} 连接到了 ${here}。选择“接管”将停止 ${host} 上的服务器及智能体，改在 ${here} 上运行；如需保持其运行，请直接连接到 ${host}。`",
+            ),
+            (
+                ": `${label} reached ${here}. Take over only if that server no longer runs, for example if ${host} was shut down or replaced: if it still runs, both servers would write the same files. To check, connect to ${host}.`,",
+                ": `${label} 连接到了 ${here}。仅在原服务器已不再运行（例如 ${host} 已关机或被替换）时才选择“接管”；若原服务器仍在运行，两个服务器同时写入同一文件会导致冲突。如需确认，请先连接到 ${host}。`,",
+            ),
+            ("const what = terminals === 0 ? 'agent or task' : 'agent, task or terminal';", "const what = terminals === 0 ? '智能体或任务' : '智能体、任务或终端';"),
+            ("buttons: ['Restart', 'Later'],", "buttons: ['立即重启', '稍后'],"),
+            ("title: 'Restart SSH server',", "title: '重启 SSH 服务器',"),
+            (
+                "message: `${label} is running server ${running}; this app is ${expected}. Restart the server now?`,",
+                "message: `${label} 当前运行的服务器版本为 ${running}，本应用版本为 ${expected}。是否立即重启服务器？`,",
+            ),
+            (
+                "detail: `Any ${what} still running on it stops. The server starts again with this app's version.`,",
+                "detail: `其上仍在运行的${what}都将停止，随后服务器将以当前应用版本重新启动。`,",
+            ),
+        ],
+        "已汉化 SSH 远程管理弹窗 -> dist/remote/remoteManager.js",
+    )
+
+    _apply_replacements(
+        os.path.join(remote_dir, "sshPrompts.js"),
+        [
+            ("const TOUCH_TITLE = 'Touch your security key';", "const TOUCH_TITLE = '请轻触您的安全密钥';"),
+            ("(who) => (isAccount(who) ? ['Password', who] : undefined),", "(who) => (isAccount(who) ? ['密码', who] : undefined),"),
+            ("(who) => (isAccount(who) ? ['Current password', who] : undefined),", "(who) => (isAccount(who) ? ['当前密码', who] : undefined),"),
+            ("(who) => (isAccount(who) ? ['New password', who] : undefined),", "(who) => (isAccount(who) ? ['新密码', who] : undefined),"),
+            ("(who) => (isAccount(who) ? ['Confirm new password', who] : undefined),", "(who) => (isAccount(who) ? ['确认新密码', who] : undefined),"),
+            ("[\"Enter passphrase for key '\", \"':\", (key) => ['Passphrase', baseName(key)]],", "[\"Enter passphrase for key '\", \"':\", (key) => ['密钥口令', baseName(key)]],"),
+            ("return ['PIN', what.slice(1, -1)];", "return ['PIN 码', what.slice(1, -1)];"),
+            ("return key < 0 ? undefined : ['PIN', baseName(what.slice(key + 5))];", "return key < 0 ? undefined : ['PIN 码', baseName(what.slice(key + 5))];"),
+            ("? `Trust ${hostName(host.split(' (')[0])}?`", "? `信任主机 ${hostName(host.split(' (')[0])} 吗？`"),
+            ("? `Connect to ${hostName(host)} anyway?`", "? `仍要连接到 ${hostName(host)} 吗？`"),
+            ("return 'Accept updated host keys?';", "return '接受更新后的主机密钥吗？';"),
+            ("return key ? `Add ${baseName(key.split(' (')[0])} to ssh-agent?` : undefined;", "return key ? `将 ${baseName(key.split(' (')[0])} 添加到 ssh-agent 吗？` : undefined;"),
+            ("return `Question from ${who}`;", "return `来自 ${who} 的询问`;"),
+            ("return `Verification code for ${who}`;", "return `${who} 的验证码`;"),
+            ("return `Password for ${who}`;", "return `${who} 的密码`;"),
+            ("return /\\bpin\\b/i.test(text) ? `PIN for ${who}` : `Sign in to ${who}`;", "return /\\bpin\\b/i.test(text) ? `${who} 的 PIN 码` : `登录到 ${who}`;"),
+            ("? `${asked[0]} for ${hostPromptsMarked ? asked[1] : label}`", "? `${hostPromptsMarked ? asked[1] : label} 的${asked[0]}`"),
+            ('<html lang="en"${dark ? \' class="dark"\' : \'\'}>', '<html lang="zh-CN"${dark ? \' class="dark"\' : \'\'}>'),
+            ('<p class="context">Connecting to <span id="label"></span></p>', '<p class="context">正在连接到 <span id="label"></span></p>'),
+            ('>Asked again: your last answer may not have worked.</div>', '>再次询问：您上次的输入可能未通过验证。</div>'),
+            (">That's too long.</div>", ">输入内容过长。</div>"),
+            ('<button id="cancel" class="secondary">Cancel</button><button id="continue" class="primary">Continue</button>', '<button id="cancel" class="secondary">取消</button><button id="continue" class="primary">继续</button>'),
+            ("buttons: confirm ? ['Yes', 'No'] : ['Cancel'],", "buttons: confirm ? ['是', '否'] : ['取消'],"),
+        ],
+        "已汉化 SSH 凭据与确认弹窗 -> dist/remote/sshPrompts.js",
+    )
+
+    _apply_replacements(
+        os.path.join(remote_dir, "signInCallback.js"),
+        [
+            ("const host = escapeHtml(opts.hostLabel ?? 'the SSH host');", "const host = escapeHtml(opts.hostLabel ?? '此 SSH 主机');"),
+            ('<!doctype html><html lang="en"><head>', '<!doctype html><html lang="zh-CN"><head>'),
+            (
+                "const SIGNED_IN = page('You have successfully authenticated.', 'You can close this tab and return to Antigravity.');",
+                "const SIGNED_IN = page('身份验证成功。', '您可以关闭此标签页并返回 Antigravity。');",
+            ),
+            (
+                'return page("Sign-in didn\'t finish", `Antigravity couldn\'t reach ${host} to finish signing in. ` +\n'
+                "        'Sign in again from Antigravity.');",
+                "return page('登录未完成', `Antigravity 无法连接到 ${host} 以完成登录，请从 Antigravity 重新登录。`);",
+            ),
+            (
+                'return page("Sign-in didn\'t finish", \'This sign-in came back from another server than the sign-in page you \' +\n'
+                "        `agreed to, so Antigravity didn't pass it on to ${host}.`);",
+                "return page('登录未完成', `此登录回调来自您同意的登录页以外的其他服务器，因此 Antigravity 未将其传递给 ${host}。`);",
+            ),
+            (
+                'return page("Sign-in didn\'t finish", `Antigravity on ${host} couldn\'t finish signing in (HTTP ${status}). ` +\n'
+                "        'Sign in again from Antigravity.');",
+                "return page('登录未完成', `${host} 上的 Antigravity 无法完成登录（HTTP ${status}），请从 Antigravity 重新登录。`);",
+            ),
+        ],
+        "已汉化 SSH 登录回调页面 -> dist/remote/signInCallback.js",
+    )
+
+    _apply_replacements(
+        os.path.join(remote_dir, "sshConnection.js"),
+        [
+            ("exports.PROMPT_CANCELLED = 'Sign-in cancelled.';", "exports.PROMPT_CANCELLED = '已取消登录。';"),
+            ("return `Checking ${label}…`;", "return `正在检查 ${label}…`;"),
+            ("return `Waiting for another window to finish installing on ${label}…`;", "return `正在等待另一个窗口在 ${label} 上完成安装…`;"),
+            ("return `Replacing an invalid server binary on ${label}…`;", "return `正在替换 ${label} 上无效的服务器二进制文件…`;"),
+            ("return `Downloading the Antigravity server on ${label}…`;", "return `正在 ${label} 上下载 Antigravity 服务器…`;"),
+            ("return `Installed the Antigravity server on ${label}.`;", "return `已在 ${label} 上安装 Antigravity 服务器。`;"),
+            ("return `Starting the Antigravity server on ${label}…`;", "return `正在 ${label} 上启动 Antigravity 服务器…`;"),
+            ("return `Connecting to the running server on ${label}…`;", "return `正在连接到 ${label} 上运行中的服务器…`;"),
+            ("return `Restarting the Antigravity server on ${label}…`;", "return `正在重启 ${label} 上的 Antigravity 服务器…`;"),
+            ("return `Checking whether another host still runs your Antigravity server…`;", "return `正在检查是否有其他主机仍在运行您的 Antigravity 服务器…`;"),
+            ("return `Moving the Antigravity server to ${label}…`;", "return `正在将 Antigravity 服务器迁移至 ${label}…`;"),
+        ],
+        "已汉化 SSH 连接进度状态 -> dist/remote/sshConnection.js",
+    )
+
+    _apply_replacements(
+        os.path.join(remote_dir, "sshErrorText.js"),
+        [
+            ("return `Error code: ${err.code}\\nLogs: ${logPath()}`;", "return `错误代码：${err.code}\\n日志路径：${logPath()}`;"),
+            ("return err.reportedByRemote ? `${label} reported: ${text}` : text;", "return err.reportedByRemote ? `${label} 返回错误：${text}` : text;"),
+            (": 'The connection was closed before it finished.';", ": '连接在完成前已关闭。';"),
+            ("return `Windows SSH hosts aren't supported yet. ${sshArgs_1.LINUX_HOST_NEEDED}`;", "return `暂不支持 Windows SSH 主机。${sshArgs_1.LINUX_HOST_NEEDED}`;"),
+            ("return pointsToLog ? `${text}\\nLogs: ${logPath()}` : text;", "return pointsToLog ? `${text}\\n日志路径：${logPath()}` : text;"),
+        ],
+        "已汉化 SSH 错误摘要文案 -> dist/remote/sshErrorText.js",
+    )
+
+    _apply_replacements(
+        os.path.join(remote_dir, "sshArgs.js"),
+        [
+            (
+                "exports.LINUX_HOST_NEEDED = 'Antigravity needs a Linux host on x64 or arm64 with glibc 2.26 or newer.';",
+                "exports.LINUX_HOST_NEEDED = 'Antigravity 需要运行 glibc 2.26 或更高版本的 x64 / arm64 Linux 主机。';",
+            ),
+            ("return `Couldn't connect to the SSH host (${String(code)}).`;", "return `无法连接到 SSH 主机 (${String(code)})。`;"),
+            (
+                "yes: 'SSH authentication failed. Check your password, code or keys, then try again.',",
+                "yes: 'SSH 身份验证失败。请检查密码、验证码或密钥后重试。',",
+            ),
+            (
+                "onReconnect: 'SSH authentication failed. Click Reconnect to sign in again.',",
+                "onReconnect: 'SSH 身份验证失败。请点击“重新连接”再次登录。',",
+            ),
+            (
+                'no: "SSH authentication failed. Antigravity can\'t answer password or code prompts on Windows yet: set up key-based login with ssh-agent, then try again.",',
+                "no: 'SSH 身份验证失败。Antigravity 在 Windows 上暂不支持交互式密码或验证码提示：请先通过 ssh-agent 配置密钥登录，然后重试。',",
+            ),
+            (
+                'return "That SSH host isn\'t valid. Enter an alias from your SSH config or a host like user@host or user@host:2222.";',
+                "return '该 SSH 主机无效。请输入 SSH 配置中的别名，或使用 user@host、user@host:2222 格式的主机地址。';",
+            ),
+            (
+                '? "The host\'s SSH key is unknown or has changed. Save it with ssh in a terminal. If it changed, ask the host\'s owner first: the connection may be intercepted."',
+                "? '主机的 SSH 密钥未知或已更改。请先在终端使用 ssh 保存该密钥；若密钥发生变更，请先向主机管理员确认以防连接遭到劫持。'",
+            ),
+            (
+                ': "The host\'s SSH key has changed or isn\'t trusted. If it changed, ask the host\'s owner first: the connection may be intercepted.";',
+                ": '主机的 SSH 密钥已更改或未受信任。若密钥发生变更，请先向主机管理员确认以防连接遭到劫持。';",
+            ),
+            (
+                "return `Couldn't connect to the SSH host. Check its name, your network and ssh config (e.g. a ProxyCommand), and that ssh to it works in a terminal${prompts === 'no' ? ' without a prompt' : ''}.`;",
+                "return `无法连接到 SSH 主机。请检查主机名、网络与 SSH 配置（例如 ProxyCommand），并确认在终端中能够${prompts === 'no' ? '免交互地' : ''}通过 ssh 正常连接。`;",
+            ),
+            (
+                'return "SSH can\'t use your SSH config file. Fix the problem ssh reports, or choose another config file.";',
+                "return 'SSH 无法使用您的 SSH 配置文件。请修复 ssh 报告的问题，或选择其他配置文件。';",
+            ),
+            (
+                "return 'SSH port forwarding failed. Make sure the server allows TCP forwarding (AllowTcpForwarding) for your account, then try again.';",
+                "return 'SSH 端口转发失败。请确认服务器允许您的账号使用 TCP 转发（AllowTcpForwarding），然后重试。';",
+            ),
+            (
+                "return `The SSH host isn't supported. ${exports.LINUX_HOST_NEEDED} Windows and macOS hosts aren't supported yet.`;",
+                "return `不支持该 SSH 主机。${exports.LINUX_HOST_NEEDED}暂不支持 Windows 和 macOS 主机。`;",
+            ),
+            (
+                "return 'Another host that shares your home directory runs the Antigravity server. Connect to that host, or connect again and choose Take Over.';",
+                "return '另一台共享主目录的主机正在运行 Antigravity 服务器。请连接到该主机，或重新连接并选择“接管”。';",
+            ),
+            (
+                'return "Couldn\'t install the Antigravity server on the SSH host. Make sure it has free disk space, and that it or this computer can download from the internet.";',
+                "return '无法在 SSH 主机上安装 Antigravity 服务器。请确认主机有足够磁盘空间，且该主机或本机可以联网下载。';",
+            ),
+            (
+                "return `The Antigravity server failed to start on the SSH host. See its log in ~/${types_1.REMOTE_INSTALL_ROOT}/data on that host.`;",
+                "return `Antigravity 服务器在 SSH 主机上启动失败。请查看该主机 ~/${types_1.REMOTE_INSTALL_ROOT}/data 中的日志。`;",
+            ),
+            (
+                "return 'The Antigravity server on the SSH host stopped. Reconnect to start it again.';",
+                "return 'SSH 主机上的 Antigravity 服务器已停止，请重新连接以再次启动。';",
+            ),
+            (
+                "return 'The SSH connection closed. Check your network connection, then reconnect.';",
+                "return 'SSH 连接已关闭。请检查网络连接后重新连接。';",
+            ),
+            ("return 'The connection was cancelled.';", "return '连接已取消。';"),
+            (
+                'return "Couldn\'t connect to the SSH host. Try ssh to it in a terminal, and see the Antigravity log for details.";',
+                "return '无法连接到 SSH 主机。请在终端尝试使用 ssh 连接，并查看 Antigravity 日志了解详情。';",
+            ),
+        ],
+        "已汉化 SSH 远程错误详细说明 -> dist/remote/sshArgs.js",
+    )
+
+    _apply_replacements(
+        os.path.join(remote_dir, "sshConfigHosts.js"),
+        [
+            ("throw invalid(`${shown} isn't a file.`);", "throw invalid(`${shown} 不是有效文件。`);"),
+            (
+                "throw invalid(`${shown} can be changed by others: it must be yours or root's, and not group- or world-writable.`);",
+                "throw invalid(`${shown} 可被其他用户修改：该文件必须归您本人或 root 所有，且不能对用户组或其他用户可写。`);",
+            ),
+            ('const NOT_CONFIG = "isn\'t an SSH config file";', "const NOT_CONFIG = '不是 SSH 配置文件';"),
+            ("const CHOOSE_CONFIG = 'Choose a file of ssh settings, such as ~/.ssh/config.';", "const CHOOSE_CONFIG = '请选择包含 SSH 配置的文件（例如 ~/.ssh/config）。';"),
+            ('const UNREADABLE = "is saved in a way ssh can\'t read";', "const UNREADABLE = '的保存格式无法被 ssh 读取';"),
+            ("const SAVE_AS_UTF8 = 'Save it as UTF-8 without a byte-order mark.';", "const SAVE_AS_UTF8 = '请将其另存为无 BOM 的 UTF-8 编码。';"),
+            ('const BINARY = notConfig("it\'s a binary file");', "const BINARY = notConfig('这是一个二进制文件');"),
+            ("const KEY = notConfig('it holds a key or certificate');", "const KEY = notConfig('它包含密钥或证书');"),
+            (
+                "const PUBLIC_KEYS = notConfig('it holds SSH public keys, like a .pub or authorized_keys file');",
+                "const PUBLIC_KEYS = notConfig('它包含 SSH 公钥（例如 .pub 或 authorized_keys 文件）');",
+            ),
+            (
+                "const HOST_KEYS = notConfig('it lists SSH host keys, like known_hosts');",
+                "const HOST_KEYS = notConfig('它记录的是 SSH 主机密钥（例如 known_hosts 文件）');",
+            ),
+            ("why: 'it starts with a byte-order mark',", "why: '文件开头包含字节顺序标记 (BOM)',"),
+            ('why: "it\'s saved as UTF-16",', "why: '文件以 UTF-16 编码保存',"),
+            ("return `${file} ${what}: ${why}. ${fix}`;", "return `${file} ${what}：${why}。${fix}`;"),
+        ],
+        "已汉化 SSH 配置文件校验提示 -> dist/remote/sshConfigHosts.js",
+    )
+
+    _apply_replacements(
+        os.path.join(remote_dir, "sshBridge.js"),
+        [
+            (
+                "const BAD_CONFIG_FILE = 'The SSH config file must be a path of at most 4 KiB.';",
+                "const BAD_CONFIG_FILE = 'SSH 配置文件路径长度不得超过 4 KiB。';",
+            ),
+            (
+                "message: 'Enter an SSH host, for example \"devbox\" or \"user@host\".',",
+                "message: '请输入 SSH 主机，例如 \"devbox\" 或 \"user@host\"。',",
+            ),
+        ],
+        "已汉化 SSH 桥接校验提示 -> dist/remote/sshBridge.js",
+    )
+
+    _apply_replacements(
+        os.path.join(remote_dir, "sshDestination.js"),
+        [
+            ("invalid('The user name before \"@\" is missing.');", "invalid('缺少 \"@\" 之前的用户名。');"),
+            ("invalid('The user name must not start with \"-\".');", "invalid('用户名不能以 \"-\" 开头。');"),
+            ('invalid(`"${shown}" isn\'t a valid user name.`);', 'invalid(`“${shown}”不是有效的用户名。`);'),
+            ("invalid('The host name is missing.');", "invalid('缺少主机名。');"),
+            ("invalid('The host name must not start with \"-\".');", "invalid('主机名不能以 \"-\" 开头。');"),
+            ('invalid(`"${host}" isn\'t a valid host name.`);', 'invalid(`“${host}”不是有效的主机名。`);'),
+            ('invalid(`Invalid port "${port}": use a number from 1 to 65535.`);', 'invalid(`端口“${port}”无效：请使用 1 到 65535 之间的数字。`);'),
+            (
+                'invalid(`"${addr}" isn\'t a valid IPv6 address. Write an IPv6 address with a port in brackets, for example [::1]:2222.`);',
+                'invalid(`“${addr}”不是有效的 IPv6 地址。带端口的 IPv6 地址请用方括号括起，例如 [::1]:2222。`);',
+            ),
+            ('invalid(`Missing "]" after the IPv6 address in "${hostPort}".`);', 'invalid(`“${hostPort}”中的 IPv6 地址后缺少 "]"。`);'),
+            ('invalid(`Unexpected "${rest}" after "]".`);', 'invalid(`"]" 后出现意外字符“${rest}”。`);'),
+            ('invalid(`Invalid percent-encoding in the user name "${s}".`);', 'invalid(`用户名“${s}”包含无效的百分号编码。`);'),
+            ("invalid('Write \"@\" inside the user name of an ssh:// URI as %40.');", "invalid('在 ssh:// URI 的用户名中请将 \"@\" 写作 %40。');"),
+            (
+                "invalid('Write an IPv6 address in an ssh:// URI in brackets, for example ssh://[::1]:2222.');",
+                "invalid('在 ssh:// URI 中请用方括号括起 IPv6 地址，例如 ssh://[::1]:2222。');",
+            ),
+            (
+                "invalid('Enter an SSH host, for example \"devbox\" or \"user@host:2222\".');",
+                "invalid('请输入 SSH 主机，例如 \"devbox\" 或 \"user@host:2222\"。');",
+            ),
+            (
+                "invalid(`The SSH host is too long (at most ${MAX_DESTINATION_LENGTH} characters).`);",
+                "invalid(`SSH 主机地址过长（最多 ${MAX_DESTINATION_LENGTH} 个字符）。`);",
+            ),
+            ("invalid('The SSH host must not start with \"-\".');", "invalid('SSH 主机不能以 \"-\" 开头。');"),
+            (
+                "invalid('The SSH host must not contain spaces or control characters.');",
+                "invalid('SSH 主机不能包含空格或控制字符。');",
+            ),
+            ("invalid(`The SSH host must not contain ${describeChar(bad[0])}.`);", "invalid(`SSH 主机不能包含字符 ${describeChar(bad[0])}。`);"),
+        ],
+        "已汉化 SSH 目标地址校验提示 -> dist/remote/sshDestination.js",
+    )
+
+
+def patch_computer_hud(dist_dir: str) -> None:
+    """汉化 v2.34.0 新增的 macOS Computer Use 桌面悬浮控制栏 -> dist/computer/*.js"""
+    comp_dir = os.path.join(dist_dir, "computer")
+    if not os.path.isdir(comp_dir):
+        return
+
+    _apply_replacements(
+        os.path.join(comp_dir, "hud.js"),
+        [
+            ("<title>AGY Desktop HUD</title>", "<title>AGY 桌面悬浮栏</title>"),
+            ("title: 'AGY Desktop HUD',", "title: 'AGY 桌面悬浮栏',"),
+            ('<div id="status">AGY is controlling your Mac</div>', '<div id="status">AGY 正在控制您的 Mac</div>'),
+            (
+                '<button id="stop">Stop</button><button id="resume" title="Let agents use this Mac again. The stopped task does not restart.">Allow again</button>',
+                '<button id="stop">停止</button><button id="resume" title="再次允许智能体使用此 Mac。已停止的任务不会自动重启。">重新允许</button>',
+            ),
+            ("end.textContent = 'Stopped';", "end.textContent = '已停止';"),
+            ("end.textContent = 'Stop';", "end.textContent = '停止';"),
+        ],
+        "已汉化桌面悬浮栏界面 -> dist/computer/hud.js",
+    )
+
+    _apply_replacements(
+        os.path.join(comp_dir, "hudState.js"),
+        [
+            ("? 'You took over — agent stopped'", "? '您已接管 — 智能体已停止'"),
+            (": 'Agent stopped';", ": '智能体已停止';"),
+            ("return { state: 'idle', text: 'Agent idle', visible };", "return { state: 'idle', text: '智能体空闲', visible };"),
+            ("? `AGY working in ${name} (background)`", "? `AGY 正在 ${name} 中工作（后台）`"),
+            (": 'AGY working in the background',", ": 'AGY 正在后台工作',"),
+            ("return { state: 'running', text: 'AGY is controlling your Mac', visible };", "return { state: 'running', text: 'AGY 正在控制您的 Mac', visible };"),
+        ],
+        "已汉化桌面悬浮栏状态文案 -> dist/computer/hudState.js",
+    )
+
+    _apply_replacements(
+        os.path.join(comp_dir, "hudAgents.js"),
+        [
+            (
+                "text: `${(0, overlay_1.overlayDisplayName)(label)} · ${app || 'starting'} · ${stopped ? 'stopped' : paused ? 'paused' : m}`,",
+                "text: `${(0, overlay_1.overlayDisplayName)(label)} · ${app || '启动中'} · ${stopped ? '已停止' : paused ? '已暂停' : (m === 'foreground' ? '前台' : '后台')}`,",
+            ),
+            ("return `${working} AGY agents working`;", "return `${working} 个 AGY 智能体工作中`;"),
+            ("return stopped === 1 ? 'Agent stopped' : `${stopped} agents stopped`;", "return stopped === 1 ? '智能体已停止' : `${stopped} 个智能体已停止`;"),
+            ("return stopped > 0 ? `${text} (+${stopped} stopped)` : text;", "return stopped > 0 ? `${text}（另有 ${stopped} 个已停止）` : text;"),
+        ],
+        "已汉化桌面悬浮栏多智能体汇总 -> dist/computer/hudAgents.js",
+    )
+
+    _apply_replacements(
+        os.path.join(comp_dir, "overlay.js"),
+        [
+            ("return 'unnamed';", "return '未命名';"),
+            ("return `Agent: ${label}`;", "return `智能体：${label}`;"),
+        ],
+        "已汉化桌面光标标签前缀 -> dist/computer/overlay.js",
+    )
 
 
 def patch_language_server_js(dist_dir: str) -> None:
@@ -1142,7 +1632,7 @@ def write_shared_web_bundle(locale_data: dict, engine_code: str, home_dir: str) 
     and cleans up the legacy bare file.
     """
     frontend_locale = {
-        "version": locale_data.get("version", "2.31.2"),
+        "version": locale_data.get("version", "2.34.0"),
         "exact": locale_data.get("exact", {}),
         "fragments": locale_data.get("fragments", []),
     }
@@ -1210,8 +1700,10 @@ def _minify_index_html_safely(raw_html: bytes) -> bytes:
     return b"".join(out_parts)
 
 
-def _rebuild_embedded_zip(orig_zip_bytes: bytes, recompress_css: bool = False) -> tuple[bytes, int]:
-    """Rebuilds the embedded ZIP with index.html loader injected and optional zlib-9 CSS recompression."""
+def _rebuild_embedded_zip(
+    orig_zip_bytes: bytes, recompress_css: bool = False, recompress_js: bool = False
+) -> tuple[bytes, int]:
+    """Rebuilds the embedded ZIP with index.html loader injected and optional zlib-9 CSS/JS recompression."""
     zin = zipfile.ZipFile(io.BytesIO(orig_zip_bytes), "r")
     eocd_pos = orig_zip_bytes.rfind(b"PK\x05\x06")
     _, _, _, _, total_entries, _, _, _ = struct.unpack("<4sHHHHIIH", orig_zip_bytes[eocd_pos : eocd_pos + 22])
@@ -1248,10 +1740,12 @@ def _rebuild_embedded_zip(orig_zip_bytes: bytes, recompress_css: bool = False) -
             comp_size = len(raw_comp_data)
             comp_type = zipfile.ZIP_DEFLATED
             flag_bits = info.flag_bits & ~0x08
-        elif recompress_css and info.filename in ("compiled_tailwind.css", "jetbox.css"):
-            raw_css = zin.read(info.filename)
+        elif (recompress_css and info.filename in ("compiled_tailwind.css", "jetbox.css")) or (
+            recompress_js and info.filename.endswith("main.js")
+        ):
+            raw_asset = zin.read(info.filename)
             cobj = zlib.compressobj(9, zlib.DEFLATED, -15)
-            cand_comp = cobj.compress(raw_css) + cobj.flush()
+            cand_comp = cobj.compress(raw_asset) + cobj.flush()
             if len(cand_comp) < info.compress_size:
                 raw_comp_data = cand_comp
                 crc = info.CRC
@@ -1368,9 +1862,11 @@ def patch_embedded_zip_in_binary(data: bytes) -> bytes:
         raise ValueError(f"内嵌 ZIP 起始偏移校验失败 (offset={hex(zip_start)})")
 
     orig_zip_bytes = data[zip_start:zip_end]
-    new_zip_bytes, diff = _rebuild_embedded_zip(orig_zip_bytes, recompress_css=False)
+    new_zip_bytes, diff = _rebuild_embedded_zip(orig_zip_bytes, recompress_css=False, recompress_js=False)
     if diff < 0:
-        new_zip_bytes, diff = _rebuild_embedded_zip(orig_zip_bytes, recompress_css=True)
+        new_zip_bytes, diff = _rebuild_embedded_zip(orig_zip_bytes, recompress_css=True, recompress_js=False)
+    if diff < 0:
+        new_zip_bytes, diff = _rebuild_embedded_zip(orig_zip_bytes, recompress_css=True, recompress_js=True)
     if diff < 0:
         raise ValueError(f"修补后内嵌 ZIP 超出原大小 ({-diff} 字节)，拒绝写入以保护二进制结构")
 
@@ -1546,25 +2042,56 @@ def _get_cached_orig_ver(backup_dir: str, orig_path: str, orig_sha: str, readonl
     return ver_str
 
 
-def _get_cached_local_agy_ver(backup_dir: str, local_agy: str, readonly: bool) -> str | None:
-    if not os.path.isfile(local_agy) or os.path.islink(local_agy):
-        return None
+def _read_regular_file_nofollow(filepath: str) -> bytes:
+    """以 O_NOFOLLOW 安全读取普通文件完整字节，拒绝跟随符号链接或特殊设备文件。"""
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(filepath, flags)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise PermissionError(f"安全拦截：目标不是普通文件 {filepath}")
+        with os.fdopen(fd, "rb") as f:
+            fd = -1
+            return f.read()
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def _safe_remove_path(path: str) -> None:
+    """安全删除文件、软链接或目录树（绝不跟随软链接递归删目标目录）。"""
+    if not os.path.lexists(path):
+        return
+    if os.path.islink(path) or not os.path.isdir(path):
+        os.unlink(path)
+    else:
+        shutil.rmtree(path)
+
+
+def _get_cached_local_agy_ver(backup_dir: str, local_agy: str, readonly: bool) -> tuple[str | None, bool]:
+    """返回 (版本字符串或 None, 是否因 stat 变化尚待探针检查)。"""
+    if not os.path.isfile(local_agy) or os.path.islink(local_agy) or not os.access(local_agy, os.X_OK):
+        return None, False
     try:
         st = os.lstat(local_agy)
     except OSError:
-        return None
+        return None, False
+    if not stat.S_ISREG(st.st_mode):
+        return None, False
     sig = _file_stat_sig(st)
     cache = _load_gemini_ver_cache(backup_dir)
     entry = cache.get("local")
-    if isinstance(entry, dict) and entry.get("stat") == sig and entry.get("version"):
-        return str(entry["version"])
+    if isinstance(entry, dict) and entry.get("stat") == sig and "version" in entry:
+        ver_val = str(entry["version"]).strip()
+        return (ver_val or None), False
     if readonly:
-        return None
+        return None, True
     ver_str = _probe_agy_version_str(local_agy, allow_chmod=False)
-    if ver_str:
-        cache["local"] = {"stat": sig, "version": ver_str}
-        _save_gemini_ver_cache(backup_dir, cache)
-    return ver_str
+    cache["local"] = {"stat": sig, "version": ver_str or ""}
+    _save_gemini_ver_cache(backup_dir, cache)
+    return ver_str, False
 
 
 def _select_gemini_base_binary(
@@ -1586,7 +2113,9 @@ def _select_gemini_base_binary(
     orig_ver = _parse_semver(orig_ver_str or "")
 
     local_agy = os.path.join(home_dir, ".local", "bin", "agy")
-    local_ver_str = _get_cached_local_agy_ver(backup_dir, local_agy, readonly=readonly)
+    local_ver_str, local_stale = _get_cached_local_agy_ver(backup_dir, local_agy, readonly=readonly)
+    if readonly and local_stale:
+        return gemini_agy_orig, None, orig_ver_str, None
     local_ver = _parse_semver(local_ver_str or "")
 
     if (
@@ -1611,8 +2140,7 @@ def _select_gemini_base_binary(
                         and entry.get("sha256")
                     ):
                         return local_agy, str(entry["sha256"]), orig_ver_str, local_ver_str
-                with open(local_agy, "rb") as f:
-                    local_bytes = f.read()
+                local_bytes = _read_regular_file_nofollow(local_agy)
                 if not _is_agy_already_patched_bytes(local_bytes):
                     local_sha = hashlib.sha256(local_bytes).hexdigest()
                     if stat_cache is not None:
@@ -1730,8 +2258,17 @@ def ensure_and_patch_gemini_agy(home_dir: str, force: bool = False) -> bool:
         log(f"已校验 Gemini 内置 Antigravity 汉化内核就绪 ({ver_note}) -> Gemini.app/Contents/Helpers/agy")
         return False
 
-    with open(base_path, "rb") as f:
-        base_data = f.read()
+    try:
+        base_data = _read_regular_file_nofollow(base_path)
+    except Exception as e:
+        log(f"警告: 安全读取 Gemini 底座二进制失败 ({e})，中止本次修补")
+        return False
+
+    actual_base_sha = hashlib.sha256(base_data).hexdigest()
+    if base_sha and actual_base_sha != base_sha:
+        log("警告: 检测到底座二进制在校验后发生变化（并发更新），已中止本次修补以确保一致性")
+        return False
+    base_sha = actual_base_sha
 
     if base_path != gemini_agy_orig and base_ver_str and orig_ver_str:
         log(f"检测到官方新版 agy CLI (v{base_ver_str} > 内置 v{orig_ver_str})，正在同步最新版底座并启用全部最新功能...")
@@ -1792,6 +2329,8 @@ def apply_all_patches_to_dir(app_dir: str, locale_data: dict, engine_code: str) 
     patch_webauthn_and_cable(dist_dir)
     patch_wizard_html(dist_dir)
     patch_wsl(dist_dir)
+    patch_remote_ssh(dist_dir)
+    patch_computer_hud(dist_dir)
     patch_language_server_js(dist_dir)
 
 
@@ -1830,15 +2369,27 @@ def ensure_and_patch_app(
 
     if need_reextract:
         log(f"检测到需要解包最新版本 (SHA256: {current_sha[:12]}...)")
-        if os.path.isdir(STAGING_APP_DIR):
-            shutil.rmtree(STAGING_APP_DIR)
+        _safe_remove_path(STAGING_APP_DIR)
         extract_asar(source_asar, STAGING_APP_DIR)
         apply_all_patches_to_dir(STAGING_APP_DIR, locale_data, engine_code)
 
-        if os.path.isdir(UNPACKED_APP_DIR):
+        swapped_old = False
+        if os.path.lexists(UNPACKED_APP_DIR):
             log("正在原子替换旧版解包目录 Resources/app ...")
-            shutil.rmtree(UNPACKED_APP_DIR)
-        os.rename(STAGING_APP_DIR, UNPACKED_APP_DIR)
+            _safe_remove_path(BACKUP_APP_DIR)
+            os.rename(UNPACKED_APP_DIR, BACKUP_APP_DIR)
+            swapped_old = True
+        try:
+            os.rename(STAGING_APP_DIR, UNPACKED_APP_DIR)
+        except Exception:
+            if swapped_old and os.path.lexists(BACKUP_APP_DIR) and not os.path.lexists(UNPACKED_APP_DIR):
+                try:
+                    os.rename(BACKUP_APP_DIR, UNPACKED_APP_DIR)
+                except OSError:
+                    pass
+            raise
+        if swapped_old:
+            _safe_remove_path(BACKUP_APP_DIR)
 
         _write_exclusive_atomic(SHA256_STATE_FILE, (current_sha + "\n").encode("utf-8"), 0o644)
     else:
@@ -1846,9 +2397,7 @@ def ensure_and_patch_app(
 
     if has_live_asar:
         log("正在将 app.asar 移至 app.asar.disabled 以启用解包目录...")
-        if os.path.isfile(ASAR_DISABLED):
-            os.remove(ASAR_DISABLED)
-        os.rename(ASAR_FILE, ASAR_DISABLED)
+        os.replace(ASAR_FILE, ASAR_DISABLED)
 
     if home_dir and os.path.isfile(ASAR_DISABLED):
         stat_cache = _load_guard_stat_cache(home_dir)
@@ -1891,8 +2440,9 @@ def is_running_inside_antigravity() -> bool:
     return False
 
 
-def _is_guard_up_to_date(home_dir: str) -> bool:
-    """Fast-path check used by --guard to determine if both ends & shared bundle are up to date."""
+def _is_guard_up_to_date(home_dir: str, allow_cache_write: bool = True) -> bool:
+    """Fast-path check used by --guard / --guard-check to determine if both ends & shared bundle are up to date."""
+    uid, _, _ = get_real_user_info()
     persist_dir = os.path.join(home_dir, ".antigravity-zh")
     persist_locale = os.path.join(persist_dir, "locales", "zh-CN.json")
     persist_engine = os.path.join(persist_dir, "engine", "dom-translator.js")
@@ -2000,7 +2550,7 @@ def _is_guard_up_to_date(home_dir: str) -> bool:
 
         return True
     finally:
-        if cache_state["dirty"]:
+        if cache_state["dirty"] and allow_cache_write and not (os.geteuid() == 0 and uid != 0):
             _save_guard_stat_cache(home_dir, stat_cache)
 
 
@@ -2204,7 +2754,7 @@ def main() -> None:
     uid, gid, home_dir = get_real_user_info()
 
     if args.guard_check:
-        sys.exit(0 if _is_guard_up_to_date(home_dir) else 1)
+        sys.exit(0 if _is_guard_up_to_date(home_dir, allow_cache_write=False) else 1)
 
     if args.guard:
         if _is_guard_up_to_date(home_dir):

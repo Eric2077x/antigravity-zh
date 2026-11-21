@@ -100,12 +100,78 @@
     if (low === 'daily') return '每日限额';
     if (low === 'monthly') return '每月限额';
     if (low === 'hourly') return '每小时限额';
-    const numMatch = low.match(/^(\d+)[-\s]+(hour|hr|day|minute|min)s?$/);
+    const numMatch = low.match(/^(\d+)[-\s]*(hour|hr|day|minute|min|second|sec|h|d|m|s)s?$/);
     if (numMatch) {
-      const unitMap = { hour: '小时', hr: '小时', day: '天', minute: '分钟', min: '分钟' };
+      const unitMap = {
+        hour: '小时',
+        hr: '小时',
+        h: '小时',
+        day: '天',
+        d: '天',
+        minute: '分钟',
+        min: '分钟',
+        m: '分钟',
+        second: '秒',
+        sec: '秒',
+        s: '秒',
+      };
       return `${numMatch[1]} ${unitMap[numMatch[2]] || numMatch[2]}限额`;
     }
     return `${raw} 限额`;
+  }
+
+  // 思考强度档位映射（供模型选择器、编排器行及模型触发按钮复用）
+  const EFFORT_LEVEL_MAP = Object.assign(Object.create(null), {
+    minimal: '极低',
+    low: '低',
+    medium: '中',
+    high: '高',
+    extra: '超高',
+    xhigh: '超高',
+    'extra high': '超高',
+    'very high': '极高',
+    'ultra high': '极高',
+    max: '最高',
+    maximum: '最高',
+  });
+
+  function mapEffortLabel(raw) {
+    if (!raw) return null;
+    const key = raw.trim().toLowerCase().replace(/\s+/g, ' ');
+    return ownLookup(EFFORT_LEVEL_MAP, key) || null;
+  }
+
+  // 仅在模型选择器/编排器/设置模型下拉上下文中翻译模型名附带的思考强度后缀
+  function translateModelEffortText(trimmed) {
+    if (!trimmed) return null;
+    // 1. 纯思考强度或“思考强度 · 上下文窗口”（如 "Extra High"、"Extra High · 1M"、"Max · 200K"）
+    const soloMatch = trimmed.match(
+      /^(Extra\s+High|Very\s+High|Ultra\s+High|XHigh|Minimal|Low|Medium|High|Extra|Max|Maximum)(?:\s*·\s*(.+))?$/i
+    );
+    if (soloMatch) {
+      const zh = mapEffortLabel(soloMatch[1]);
+      if (zh) return soloMatch[2] ? `${zh} · ${soloMatch[2]}` : zh;
+    }
+    // 2. 括号内思考强度后缀（如 "GPT-OSS 120B (Medium)"、"Gemini 4 Pro (High Thinking)"）
+    const parenMatch = trimmed.match(
+      /^(.+?)\s*\((Extra\s+High|Very\s+High|Ultra\s+High|XHigh|Minimal|Low|Medium|High|Max|Maximum)(\s+Thinking)?\)$/i
+    );
+    if (parenMatch) {
+      const zh = mapEffortLabel(parenMatch[2]);
+      if (zh) return `${parenMatch[1].trim()}（${zh}${parenMatch[3] ? '思考' : ''}）`;
+    }
+    // 3. 空格拼接思考强度后缀（如编排器行 "Claude Opus 5.5 High"、"Claude Opus 5.5 Extra High"）
+    const suffixMatch = trimmed.match(
+      /^(.+?)\s+(Extra\s+High|Very\s+High|Ultra\s+High|XHigh|Minimal|Low|Medium|High|Extra|Max|Maximum)(?:\s*·\s*(.+))?$/i
+    );
+    if (suffixMatch) {
+      const zh = mapEffortLabel(suffixMatch[2]);
+      if (zh) {
+        const base = suffixMatch[1].trim() === 'Orchestrator' ? '编排器' : suffixMatch[1].trim();
+        return `${base} ${zh}${suffixMatch[3] ? ` · ${suffixMatch[3]}` : ''}`;
+      }
+    }
+    return null;
   }
 
   const CORE_TERMS_FALLBACK = Object.assign(Object.create(null), {
@@ -1335,7 +1401,17 @@
       },
     },
     { re: /^Select\s+project,\s*current:\s*(.+)$/i, fn: (m) => `选择项目，当前：${m[1]}` },
-    { re: /^Select\s+model,\s*current:\s*(.+)$/i, fn: (m) => `选择模型，当前：${m[1]}` },
+    {
+      re: /^Select\s+model,\s*current:\s*(.+)$/i,
+      fn: (m) => {
+        let cur = m[1].trim();
+        if (/^Orchestrator\b/i.test(cur)) {
+          cur = cur.replace(/^Orchestrator\b/i, '编排器');
+        }
+        cur = translateModelEffortText(cur) || cur;
+        return `选择模型，当前：${cur}`;
+      },
+    },
     {
       re: /^Where\s+the\s+agent\s+runs,\s*current:\s*(.+)$/i,
       fn: (m) => `智能体运行位置，当前：${dictLookup(m[1]) || m[1]}`,
@@ -1543,6 +1619,58 @@
       fn: (m) =>
         `您可以升级到${m[1] ? '更高等级的 ' : ''}${m[2]} 套餐，以获取${/highest/i.test(m[3]) ? '最高' : '更高'}速率限额。`,
     },
+    // 用量弹窗限额窗口与重置时间组合（如 "5h limit"、"Daily limit, resets in 4h 23m"）
+    {
+      re: /^(\d+[smhd])\s+limit$/i,
+      fn: (m) => translateQuotaWindow(m[1]),
+    },
+    {
+      re: /^(Daily|Weekly|Monthly|Hourly|5-hour|Five-hour|\d+[smhd])\s+limit,\s*resets\s+in\s+(.+)$/i,
+      fn: (m) => {
+        const win = translateQuotaWindow(m[1]);
+        const dur = translateQuotaDuration(m[2]);
+        const durLead = /^[\u4e00-\u9fff]/.test(dur) ? '' : ' ';
+        return `${win}，将在${durLead}${dur}后重置`;
+      },
+    },
+    // AI 积分不足与基础配额刷新多句拼接提示（ycc 组合态）
+    {
+      re: /^(?:You\s+need\s+(?:at\s+least\s+(\d+)|more)\s+AI\s+Credits\s+to\s+send\s+messages\.\s*To\s+continue\s+using\s+(.+?)\s+now,\s*purchase\s+more\s+AI\s+Credits\.\s*)?(?:Your\s+plan's\s+baseline\s+quota\s+will\s+refresh\s+on\s+(.+?)\.\s*)?(?:To\s+continue\s+using\s+this\s+model\s+now,\s*enable\s+AI\s+Credit\s+overages\.?)?$/i,
+      fn: (m) => {
+        if (!m[0] || (!m[2] && !m[3] && !/overages/i.test(m[0]))) return null;
+        const parts = [];
+        if (m[2]) {
+          const need = m[1] ? `至少 ${m[1]} 个` : '更多';
+          const model = m[2].toLowerCase() === 'this model' ? '此模型' : m[2];
+          parts.push(`发送消息需要${need} AI 积分。如需立即继续使用 ${model}，请购买更多 AI 积分。`);
+        }
+        if (m[3]) {
+          parts.push(`您套餐的基础配额将于 ${m[3]} 刷新。`);
+        }
+        if (/enable\s+AI\s+Credit\s+overages/i.test(m[0])) {
+          parts.push('如需立即继续使用此模型，请开启 AI 积分超额抵扣。');
+        }
+        return parts.length > 0 ? parts.join(' ') : null;
+      },
+    },
+    {
+      re: /^Your\s+Plan:\s*(.+)$/i,
+      fn: (m) => `当前套餐：${m[1].trim()}`,
+    },
+    {
+      re: /^((?:Gemini|Claude|GPT|O[134]|Llama|DeepSeek|Qwen|Mistral)[^\n()]{1,60})\s*\((Extra\s+High|Very\s+High|Ultra\s+High|XHigh|Minimal|Low|Medium|High|Max|Maximum)(\s+Thinking)?\)$/i,
+      fn: (m) => {
+        const zh = mapEffortLabel(m[2]);
+        return zh ? `${m[1].trim()}（${zh}${m[3] ? '思考' : ''}）` : null;
+      },
+    },
+    {
+      re: /^(Project|Workspace|Global|Local|Remote|Cloud|User|Default|Organization|Team|App|System|This\s+Computer)\s+setting$/i,
+      fn: (m) => {
+        const mapped = dictLookup(m[1].trim());
+        return mapped ? `${mapped}设置` : null;
+      },
+    },
     {
       re: /^(Agent\s+execution|Agent)\s+terminated\s+due\s+to\s+error(?::\s*([\s\S]+))?\.?$/i,
       fn: (m) => {
@@ -1635,6 +1763,677 @@
     {
       re: /^Search\s+for\s+["“'](.+?)["”']\s+in\s+the\s+Marketplace$/i,
       fn: (m) => `在扩展市场中搜索“${m[1]}”`,
+    },
+    // --- 12. Antigravity v2.34.0 与 Gemini agy v1.5.13 新增动态句式规则 ---
+    {
+      re: /^Deleted\s+cookies\s+for\s+(.+)$/i,
+      fn: (m) => `已删除 ${m[1]} 的 Cookie`,
+    },
+    {
+      re: /^(\d+)\s+cookies?$/i,
+      fn: (m) => `${m[1]} 个 Cookie`,
+    },
+    {
+      re: /^Give\s+each\s+Best\s+of\s+N\s+fork\s+a\s+full\s+clone\s+of\s+your\s+workspace,\s*including\s+its\s+local\s+commit\s+history\.\s*Choosing\s+a\s+winner\s+then\s+gives\s+your\s+workspace\s+that\s+fork's\s+state,\s*so\s+the\s+commits\s+it\s+made\s+are\s+kept\.\s*Forks\s+take\s+longer\s+to\s+create\s+than\s+the\s+default\s+CitC\s+clone\.(?:\s+See\s+(.+?)\.?)?$/i,
+      fn: (m) =>
+        `为每个多路择优分支创建工作区的完整克隆（包含本地提交历史）。选定优胜分支后，当前工作区将采用该分支的状态，从而保留其创建的提交。创建分支所需时间会比默认的 CitC 克隆更长。${m[1] ? `详情参见 ${m[1]}。` : ''}`,
+    },
+    {
+      re: /^Give\s+each\s+Best\s+of\s+N\s+fork\s+its\s+own\s+clone\s+of\s+your\s+Git\s+repository\s+instead\s+of\s+a\s+copy-on-write\s+overlay\.\s*Each\s+fork\s+is\s+then\s+a\s+real\s+repository,\s*so\s+commits\s+it\s+makes\s+are\s+kept\s+when\s+you\s+choose\s+it\s+as\s+the\s+winner\.\s*Forks\s+take\s+longer\s+to\s+create,\s*and\s+the\s+wait\s+grows\s+with\s+the\s+size\s+of\s+your\s+repository\.(?:\s+See\s+(.+?)\.?)?$/i,
+      fn: (m) =>
+        `为每个多路择优分支创建独立的 Git 仓库完整克隆（而非写时复制层）。每个分支都是真实的独立仓库，选为优胜分支后其提交记录将完整保留。创建分支耗时较长，且等待时间随仓库大小增长。${m[1] ? `详情参见 ${m[1]}。` : ''}`,
+    },
+    {
+      re: /^When\s+toggled\s+on,\s*(.+?)\s+collects\s+usage\s+data\s+to\s+help\s+Google\s+enhance\s+performance\s+and\s+features\.\s*Telemetry\s+is\s+turned\s+off\s+for\s+your\s+account\.\s*This\s+means\s+(.+?)\s+does\s+not\s+collect\s+any\s+of\s+your\s+prompts,\s*content,\s*or\s+model\s+responses,\s*but\s+will\s+still\s+collect\s+general\s+usage\s+patterns\s*\(e\.g\.,\s*feature\s+adoption,\s*active\s+user\s+counts\)\.?$/i,
+      fn: (m) =>
+        `开启后，${m[1]} 将收集使用数据，以帮助 Google 提升性能和功能。\n\n您的账号已关闭遥测功能。这意味着 ${m[2]} 不会收集您的任何提示词、内容或模型回复，但仍会收集通用使用模式（例如功能采用率、活跃用户数）。`,
+    },
+    // 插件包安装与移除摘要句式
+    {
+      re: /^(\d+)\s+plugins?,\s*all\s+already\s+installed\.\s*Adding\s+the\s+bundle\s+installs\s+plugins\s+it\s+gains\s+later\.?$/i,
+      fn: (m) => `共 ${m[1]} 个插件，均已安装。添加插件包后将自动安装该插件包后续新增的插件。`,
+    },
+    {
+      re: /^(\d+)\s+plugins?\.\s*Adding\s+the\s+bundle\s+installs\s+plugins\s+it\s+gains\s+later\.?$/i,
+      fn: (m) => `共 ${m[1]} 个插件。添加插件包后将自动安装该插件包后续新增的插件。`,
+    },
+    {
+      re: /^(\d+)\s+plugins?\.\s*Add\s+bundle\s+installs\s+(?:all\s+of\s+them|it)\.?$/i,
+      fn: (m) => `共 ${m[1]} 个插件。添加插件包后将${Number(m[1]) === 1 ? '安装该插件' : '全部安装'}。`,
+    },
+    {
+      re: /^(\d+)\s+plugins?\.\s*Add\s+bundle\s+installs\s+(\d+);\s*the\s+ones\s+you\s+already\s+have\s+stay\s+as\s+they\s+are\.?$/i,
+      fn: (m) => `共 ${m[1]} 个插件。添加插件包后将安装其中 ${m[2]} 个；您已安装的插件将保持不变。`,
+    },
+    {
+      re: /^(\d+)\s+plugins?\.\s*Disabling\s+or\s+removing\s+the\s+bundle\s+applies\s+only\s+to\s+the\s+ones\s+it\s+installed\.?$/i,
+      fn: (m) => `共 ${m[1]} 个插件。禁用或移除插件包仅影响由该插件包安装的插件。`,
+    },
+    {
+      re: /^This\s+(plugin|skill|bundle)'s\s+source\s+is\s+in\s+(.+?),\s*which\s+can\s+have\s+looser\s+review\s+standards\s+than\s+standard\s+Google\s+code\.\s*Review\s+its\s+contents\s+before\s+installing\.?$/i,
+      fn: (m) => {
+        const kMap = { plugin: '插件', skill: '技能', bundle: '插件包' };
+        return `此${ownLookup(kMap, m[1].toLowerCase()) || m[1]}的源码位于 ${m[2]}，其审查标准可能低于标准 Google 代码。请在安装前仔细审阅其内容。`;
+      },
+    },
+    // 步骤计划、子智能体/计时器组合状态、倒计时与浏览器实时状态
+    {
+      re: /^(\d+)\/(\d+)\s+steps?$/i,
+      fn: (m) => `${m[1]}/${m[2]} 步`,
+    },
+    {
+      re: /^(.+?)\.\s*(Hide|Show)\s+plan$/i,
+      fn: (m) => {
+        const left = translateString(m[1]) || m[1];
+        return `${left}。${m[2].toLowerCase() === 'hide' ? '隐藏' : '显示'}计划`;
+      },
+    },
+    {
+      re: /^(\d+)\s+(skipped|blocked)$/i,
+      fn: (m) => `${m[1]} ${m[2].toLowerCase() === 'skipped' ? '项已跳过' : '个已阻塞'}`,
+    },
+    {
+      re: /^(?:(?:Waiting\s+for\s+(?:\d+\s+timers?|(?:.+?\s+)?timer)|\d+\s+(?:subagents?\/tasks|subagents?|tasks?)\s+(?:running|blocked)|\d+\s+blocked)(?:,\s*(?:\d+\s+(?:subagents?\/tasks|subagents?|tasks?)\s+(?:running|blocked)|\d+\s+blocked))+)$/i,
+      fn: (m) => m[0].split(/,\s*/).map((seg) => translateString(seg) || seg).join('，'),
+    },
+    {
+      re: /^(\d+)\s+(subagents?\/tasks|subagents?|tasks?)\s+(running|blocked)$/i,
+      fn: (m) => {
+        const nMap = {
+          subagent: '个子智能体',
+          subagents: '个子智能体',
+          task: '个任务',
+          tasks: '个任务',
+          'subagent/tasks': '个子智能体/任务',
+          'subagents/tasks': '个子智能体/任务',
+        };
+        const st = m[3].toLowerCase() === 'running' ? '运行中' : '已阻塞';
+        return `${m[1]} ${ownLookup(nMap, m[2].toLowerCase()) || m[2]}${st}`;
+      },
+    },
+    {
+      re: /^Waiting\s+for\s+(\d+)\s+timers?$/i,
+      fn: (m) => `等待 ${m[1]} 个计时器`,
+    },
+    {
+      re: /^Waiting\s+for\s+((?:.+?\s+)?timer)$/i,
+      fn: (m) => (m[1].toLowerCase() === 'timer' ? '等待计时器' : `等待 ${m[1]}`),
+    },
+    {
+      re: /^((?:\d+d\s*)?(?:\d+h\s*)?(?:\d+m\s*)?(?:\d+s)?)\s+left$/i,
+      fn: (m) => {
+        const dur = (m[1] || '').trim();
+        return dur && /\d[dhms]$/i.test(dur) ? `剩余 ${translateDuration(dur)}` : null;
+      },
+    },
+    {
+      re: /^Thinking\s*\((\d+)s\)(?:…|\.\.\.)$/i,
+      fn: (m) => `思考中 (${m[1]} 秒)…`,
+    },
+    {
+      re: /^Using\s+browser\s*·\s*(.+?)\s*\((\d+)s\)$/i,
+      fn: (m) => `正在使用浏览器 · ${translateString(m[1]) || m[1]} (${m[2]} 秒)`,
+    },
+    {
+      re: /^Showing\s+latest\s+(\d+)\s+browser\s+steps?$/i,
+      fn: (m) => `显示最近 ${m[1]} 个浏览器步骤`,
+    },
+    {
+      re: /^(Generat(?:e|ing|ed))\s+with\s+(.+?)(\s*🍌)?$/i,
+      fn: (m) => {
+        const vMap = { generate: '使用', generating: '正在使用', generated: '已使用' };
+        const act = ownLookup(vMap, m[1].toLowerCase()) || m[1];
+        const tail = m[1].toLowerCase() === 'generating' ? '生成中' : '生成';
+        return `${act} ${m[2]} ${tail}${m[3] || ''}`;
+      },
+    },
+    // 内联权限与交互询问卡片
+    {
+      re: /^Requesting\s+permission\s+to\s+(read|write|run\s*\(unsandboxed\)|run|use|download\s+from|grant\s+administrator\s+access\s+for|access)\s+(.+)$/i,
+      fn: (m) => {
+        const aMap = {
+          read: '读取',
+          write: '写入',
+          run: '运行',
+          'run (unsandboxed)': '在沙盒外运行',
+          use: '使用',
+          'download from': '从以下来源下载：',
+          'grant administrator access for': '授予管理员权限以执行：',
+          access: '访问',
+        };
+        const act = ownLookup(aMap, m[1].toLowerCase().replace(/\s+/g, ' ')) || m[1];
+        return `请求权限以${act}${/[：:]$/.test(act) ? '' : ' '}${m[2]}`;
+      },
+    },
+    {
+      re: /^Conflicts\s+with\s+your\s+configured\s+Ask\s+permission:\s*(.+)$/i,
+      fn: (m) => `与您配置的“询问”权限冲突：${m[1]}`,
+    },
+    {
+      re: /^Requires\s+manual\s+confirmation:\s*(.+)$/i,
+      fn: (m) => `需要手动确认：${m[1]}`,
+    },
+    {
+      re: /^Allow\s+(read\s+access\s+to\s+this\s+path|write\s+access\s+to\s+this\s+path|reading\s+this\s+URL|executing\s+actions\s+on\s+this\s+URL|browser\s+downloads\s+from\s+this\s+site|running\s+this\s+command\s+outside\s+the\s+sandbox|running\s+this\s+command|using\s+this\s+MCP\s+tool|a\s+one-time\s+administrator\s+\(UAC\)\s+elevation|access\s+to\s+this\s+resource)\?$/i,
+      fn: (m) => {
+        const pMap = {
+          'read access to this path': '读取此路径',
+          'write access to this path': '写入此路径',
+          'reading this url': '读取此 URL',
+          'executing actions on this url': '在此 URL 上执行操作',
+          'browser downloads from this site': '浏览器从此网站下载文件',
+          'running this command': '运行此命令',
+          'running this command outside the sandbox': '在沙盒外运行此命令',
+          'using this mcp tool': '使用此 MCP 工具',
+          'a one-time administrator (uac) elevation': '一次性管理员 (UAC) 提权',
+          'access to this resource': '访问此资源',
+        };
+        return `允许${ownLookup(pMap, m[1].toLowerCase().replace(/\s+/g, ' ')) || m[1]}吗？`;
+      },
+    },
+    {
+      re: /^Open\s+Subagent:\s*(.+)$/i,
+      fn: (m) => `打开子智能体：${m[1]}`,
+    },
+    {
+      re: /^Dismiss(?:ed)?:\s*(.+)$/i,
+      fn: (m) => `${/^dismissed/i.test(m[0]) ? '已忽略' : '忽略'}：${m[1]}`,
+    },
+    {
+      re: /^Skipped(?::\s*|\s+)(.+)$/i,
+      fn: (m) => (m[1].length <= 80 ? `已跳过：${m[1]}` : null),
+    },
+    {
+      re: /^Please\s+retry:\s*(.+)$/i,
+      fn: (m) => `请重试：${m[1]}`,
+    },
+    {
+      re: /^Sent\s+response:\s*(.+)$/i,
+      fn: (m) => `已发送回复：${m[1]}`,
+    },
+    {
+      re: /^Failed\s+to\s+send\s+(response|interaction|cancellation):\s*(.+)$/i,
+      fn: (m) => {
+        const kMap = { response: '回复', interaction: '交互', cancellation: '取消请求' };
+        return `发送${ownLookup(kMap, m[1].toLowerCase()) || m[1]}失败：${m[2]}`;
+      },
+    },
+    // 本机电脑权限引导与实时预览状态
+    {
+      re: /^(.+?)\s+needs\s+(Accessibility|Screen\s+Recording|both)\s+to\s+use\s+your\s+computer\.?$/i,
+      fn: (m) => {
+        const subj = /^the\s+app$/i.test(m[1]) ? '此应用' : m[1];
+        const sep = /[\u4e00-\u9fff]$/.test(subj) ? '' : ' ';
+        const pMap = { accessibility: '“辅助功能”权限', 'screen recording': '“屏幕录制”权限', both: '“辅助功能”和“屏幕录制”权限' };
+        return `${subj}${sep}需要${ownLookup(pMap, m[2].toLowerCase().replace(/\s+/g, ' ')) || m[2]}才能操作您的电脑。`;
+      },
+    },
+    {
+      re: /^Relaunch\s+(.+?)\s+to\s+finish\s+Screen\s+Recording\.?$/i,
+      fn: (m) => {
+        const app = /^the\s+app$/i.test(m[1]) ? '应用' : m[1];
+        const sep = /^[\u4e00-\u9fff]/.test(app) ? '' : ' ';
+        return `重新启动${sep}${app}${sep}以完成“屏幕录制”权限设置。`;
+      },
+    },
+    {
+      re: /^(Open|Reopen)\s+(Accessibility|Screen\s+Recording)\s+settings$/i,
+      fn: (m) => `${m[1].toLowerCase() === 'reopen' ? '重新打开' : '打开'}${m[2].toLowerCase() === 'accessibility' ? '辅助功能' : '屏幕录制'}设置`,
+    },
+    {
+      re: /^(Accessibility|Screen\s+Recording)\s+settings$/i,
+      fn: (m) => `${m[1].toLowerCase() === 'accessibility' ? '辅助功能' : '屏幕录制'}设置`,
+    },
+    {
+      re: /^(\d+)\s+agents?\s+working,\s*live\s+preview\s+unavailable$/i,
+      fn: (m) => `${m[1]} 个智能体工作中，实时预览不可用`,
+    },
+    {
+      re: /^Live\s+preview\s+unavailable\s*·\s*(.+)$/i,
+      fn: (m) => `实时预览不可用 · ${dictLookup(m[1]) || m[1]}`,
+    },
+    // 自动化定时计划与下次运行时间
+    {
+      re: /^Next\s+run\s+(today|tomorrow|on\s+.+?)\s+around\s+(.+)$/i,
+      fn: (m) => {
+        const dayMap = {
+          today: '今天',
+          tomorrow: '明天',
+          'on sunday': '周日',
+          'on monday': '周一',
+          'on tuesday': '周二',
+          'on wednesday': '周三',
+          'on thursday': '周四',
+          'on friday': '周五',
+          'on saturday': '周六',
+        };
+        const k = m[1].toLowerCase().replace(/\s+/g, ' ');
+        const dayZh = ownLookup(dayMap, k) || `在 ${m[1].replace(/^on\s+/i, '')}`;
+        return `下次运行：${dayZh} ${m[2]} 左右`;
+      },
+    },
+    {
+      re: /^Running\s+for\s+(.+)$/i,
+      fn: (m) => `已运行 ${translateDuration(m[1])}`,
+    },
+    {
+      re: /^Up\s+(\d+(?:[dhms]|\s*(?:days?|hours?|hrs?|minutes?|mins?|seconds?|secs?)).*)$/i,
+      fn: (m) => `已运行 ${translateDuration(m[1])}`,
+    },
+    {
+      re: /^Managed\s+by\s+the\s+(.+?)\s+(plugin|automation)$/i,
+      fn: (m) => {
+        const kind = m[2].toLowerCase() === 'plugin' ? '插件' : '自动化任务';
+        const nm = m[1].toLowerCase() === m[2].toLowerCase() ? '' : ` ${m[1]} `;
+        return `由${nm}${kind}管理`;
+      },
+    },
+    {
+      re: /^Agents\s+created\s+by\s+this\s+(.+?)\s+run\s+in\s+a\s+dedicated\s+(project|workspace)\s+with\s+its\s+own\s+permissions\.\s*You\s+can\s+change\s+the\s+permissions\s+in\s+the\s+(?:project|workspace)\s+settings\s+page\.?$/i,
+      fn: (m) => {
+        const scope = m[2].toLowerCase() === 'project' ? '项目' : '工作区';
+        const kind = m[1].toLowerCase() === 'automation' ? '自动化任务' : m[1];
+        return `由此${kind}创建的智能体将在拥有独立权限的专用${scope}中运行。您可以在${scope}设置页面中更改这些权限。`;
+      },
+    },
+    {
+      re: /^Connect\s+an\s+account\s+for\s+(.+?)\s+so\s+the\s+agent\s+can\s+run\s+automations\.?$/i,
+      fn: (m) => `请连接 ${m[1]} 账号，以便智能体运行自动化任务。`,
+    },
+    {
+      re: /^Sign-ins\s+to\s+(.+?)\s+are\s+kept\s+in\s+the\s+cloud\s+with\s+your\s+account\.?$/i,
+      fn: (m) => `${m[1]} 的登录状态会随您的账号保存在云端。`,
+    },
+    {
+      re: /^(.+?)\s+needs?\s+the\s+terminal\s+sandbox,\s*which\s+isn't\s+available\s+on\s+this\s+host\.?$/i,
+      fn: (m) => `${m[1]} 需要终端沙盒，但此主机不支持终端沙盒。`,
+    },
+    // 首页问候语、历史消息加载、模型重试与内置浏览器错误页
+    {
+      re: /^Hey\s+(.+?),\s*what\s+should\s+we\s+build\s+today\?$/i,
+      fn: (m) => `你好 ${m[1]}，今天想一起构建什么？`,
+    },
+    {
+      re: /^Welcome\s+back,\s*(.+?)\.\s*Where\s+should\s+we\s+pick\s+up\?$/i,
+      fn: (m) => `欢迎回来，${m[1]}。我们从哪里继续？`,
+    },
+    {
+      re: /^Good\s+to\s+see\s+you,\s*(.+?)\.\s*What's\s+next\?$/i,
+      fn: (m) => `很高兴见到你，${m[1]}。接下来要做什么？`,
+    },
+    {
+      re: /^Welcome\s+to\s+(.+?)!$/i,
+      fn: (m) => `欢迎使用 ${m[1]}！`,
+    },
+    {
+      re: /^No\s+messages\s+in\s+last\s+(\d+)\s+steps?\s*(?:—|·|,)\s*(load\s+older|Load\s+more)$/i,
+      fn: (m) => `最近 ${m[1]} 个步骤中没有消息 · ${/more/i.test(m[2]) ? '加载更多' : '加载更早消息'}`,
+    },
+    {
+      re: /^No\s+visible\s+messages\s+in\s+last\s+(\d+)\s+steps?\.\s*Activate\s+Load\s+older\s+messages\s+to\s+continue\.?$/i,
+      fn: (m) => `最近 ${m[1]} 个步骤中没有可见消息，请点击“加载更早消息”以继续。`,
+    },
+    {
+      re: /^Model\s+unavailable,\s*retrying(?:\s+in\s+(\d+)s)?(.*)$/i,
+      fn: (m) => `模型不可用，${m[1] ? `将在 ${m[1]} 秒后重试` : '正在重试'}${m[2] || ''}`,
+    },
+    {
+      re: /^No\s+server\s+is\s+listening\s+on\s+port\s+(\d+)\s+inside\s+the\s+remote\s+workspace\.\s*Start\s+it,\s*or\s+ask\s+the\s+agent\s+to,\s*then\s+retry\.?$/i,
+      fn: (m) => `远程工作区中的端口 ${m[1]} 上没有正在监听的服务。请启动服务（或让智能体启动），然后重试。`,
+    },
+    {
+      re: /^Resume\s+the\s+conversation\s+to\s+start\s+its\s+workspace\s+again,\s*then\s+start\s+the\s+server\s+on\s+port\s+(\d+)\s+and\s+retry\.?$/i,
+      fn: (m) => `请先恢复对话以重新启动其工作区，然后在端口 ${m[1]} 上启动服务并重试。`,
+    },
+    {
+      re: /^(.+?)\s+(refused\s+to\s+connect|took\s+too\s+long\s+to\s+respond|could\s+not\s+find\s+the\s+requested\s+page|is\s+currently\s+unable\s+to\s+handle\s+this\s+request)\.?$/i,
+      fn: (m) => {
+        if (m[1].length > 90 || /\s{2,}/.test(m[1])) return null;
+        const msgMap = {
+          'refused to connect': '拒绝了连接请求。',
+          'took too long to respond': '响应时间过长。',
+          'could not find the requested page': '未找到所请求的页面。',
+          'is currently unable to handle this request': '当前无法处理此请求。',
+        };
+        return `${m[1]} ${ownLookup(msgMap, m[2].toLowerCase().replace(/\s+/g, ' ')) || m[2]}`;
+      },
+    },
+    {
+      re: /^(.+?)[’']s\s+server\s+IP\s+address\s+could\s+not\s+be\s+found\.?$/i,
+      fn: (m) => `找不到 ${m[1]} 的服务器 IP 地址。`,
+    },
+    {
+      re: /^Check\s+if\s+there\s+is\s+a\s+typo\s+in\s+(.+?),\s*or\s+open\s+the\s+page\s+in\s+your\s+external\s+browser\.?$/i,
+      fn: (m) => `请检查 ${m[1] === 'the address' ? '网址' : m[1]} 是否有拼写错误，或在外部浏览器中打开该页面。`,
+    },
+    {
+      re: /^The\s+certificate\s+was\s+rejected\s+\((.+?)\)\.?$/i,
+      fn: (m) => `证书已被拒绝 (${m[1]})。`,
+    },
+    // 听写语言排序、插件/MCP/项目/Git/PDF 及其他动态界面句式
+    {
+      re: /^Move\s+(.+?)\s+(earlier|later)$/i,
+      fn: (m) => `将 ${m[1]} ${m[2].toLowerCase() === 'earlier' ? '前移' : '后移'}`,
+    },
+    {
+      re: /^(\d+)\s+accounts?$/i,
+      fn: (m) => `${m[1]} 个账号`,
+    },
+    {
+      re: /^(\d+)\s+(days?|seconds?|turns?)$/i,
+      fn: (m) => {
+        const u = m[2].toLowerCase();
+        const zhU = u.startsWith('day') ? '天' : u.startsWith('sec') ? '秒' : '轮';
+        return `${m[1]} ${zhU}`;
+      },
+    },
+    {
+      re: /^\+(\d+)\s+more$/i,
+      fn: (m) => `另外 ${m[1]} 项`,
+    },
+    {
+      re: /^See\s+(\d+)\s+more(?:\s+(.+))?$/i,
+      fn: (m) => (m[2] ? `查看更多 ${m[1]} 个 ${dictLookup(m[2]) || m[2]}` : `再看 ${m[1]} 项`),
+    },
+    {
+      re: /^Add\s*\((\d+)\)$/i,
+      fn: (m) => `添加 (${m[1]})`,
+    },
+    {
+      re: /^(\d+)\s+folders?\s+in\s+this\s+project\s+could\s+not\s+be\s+loaded\s+because\s+their\s+locations\s+are\s+invalid\.?$/i,
+      fn: (m) => `此项目中有 ${m[1]} 个文件夹因位置无效而无法加载。`,
+    },
+    {
+      re: /^Could\s+not\s+apply\s+the\s+selected\s+permissions:\s*(.+)$/i,
+      fn: (m) => `无法应用所选权限：${m[1]}`,
+    },
+    {
+      re: /^Failed\s+to\s+create\s+project:\s*(.+)$/i,
+      fn: (m) => `创建项目失败：${m[1]}`,
+    },
+    {
+      re: /^Failed\s+to\s+delete\s+(project|workspace):\s*(.+)$/i,
+      fn: (m) => `删除${m[1].toLowerCase() === 'project' ? '项目' : '工作区'}失败：${m[2]}`,
+    },
+    {
+      re: /^(Project|Workspace)\s+(Settings|archived|deleted)$/i,
+      fn: (m) => {
+        const p = m[1].toLowerCase() === 'project' ? '项目' : '工作区';
+        const sMap = { settings: '设置', archived: '已归档', deleted: '已删除' };
+        return `${p}${ownLookup(sMap, m[2].toLowerCase()) || m[2]}`;
+      },
+    },
+    {
+      re: /^(Archive|Copy)\s+(Project|Workspace)(?:\s+Name)?$/i,
+      fn: (m) => {
+        const p = m[2].toLowerCase() === 'project' ? '项目' : '工作区';
+        return m[1].toLowerCase() === 'archive' ? `归档${p}` : `复制${p}名称`;
+      },
+    },
+    {
+      re: /^Creating\s+(project|workspace)(?:…|\.\.\.)$/i,
+      fn: (m) => `正在创建${m[1].toLowerCase() === 'project' ? '项目' : '工作区'}…`,
+    },
+    {
+      re: /^Opens\s+the\s+New\s+Conversation\s+screen\s+for\s+this\s+(project|workspace)$/i,
+      fn: (m) => `为此${m[1].toLowerCase() === 'project' ? '项目' : '工作区'}打开新建对话页面`,
+    },
+    {
+      re: /^(.+?)\s+\((Default|Archived|latest|unavailable|write-in)\)$/i,
+      fn: (m) => {
+        const tMap = { default: '默认', archived: '已归档', latest: '最新', unavailable: '不可用', 'write-in': '自定义输入' };
+        return `${m[1]}（${ownLookup(tMap, m[2].toLowerCase()) || m[2]}）`;
+      },
+    },
+    {
+      re: /^(.+?),\s*(error|setup\s+required)$/i,
+      fn: (m) => `${m[1]}，${m[2].toLowerCase() === 'error' ? '出错' : '需要配置'}`,
+    },
+    {
+      re: /^(Enable|Disable)\s+(.+?)\s+tool\s+for\s+(.+)$/i,
+      fn: (m) => `为 ${m[3]} ${m[1].toLowerCase() === 'enable' ? '启用' : '禁用'} ${m[2]} 工具`,
+    },
+    {
+      re: /^Configure\s+(.+?),\s*values\s+missing$/i,
+      fn: (m) => `配置 ${m[1]}（缺少必填值）`,
+    },
+    {
+      re: /^Fix\s+with\s+Agent:\s*(.+)$/i,
+      fn: (m) => `让智能体修复：${m[1]}`,
+    },
+    {
+      re: /^Plugins\s+in\s+(.+)$/i,
+      fn: (m) => `${m[1]} 中的插件`,
+    },
+    {
+      re: /^(Skill|Plugin)\s+installed:\s*(.+)$/i,
+      fn: (m) => `已安装${m[1].toLowerCase() === 'skill' ? '技能' : '插件'}：${m[2]}`,
+    },
+    {
+      re: /^Signed\s+in:\s*(.+)$/i,
+      fn: (m) => `已登录：${m[1]}`,
+    },
+    {
+      re: /^(.+?)\s+needs\s+you\s+to\s+sign\s+in\s+before\s+it\s+can\s+be\s+used\.?$/i,
+      fn: (m) => `使用 ${m[1]} 前需要先登录。`,
+    },
+    {
+      re: /^(Connect|Disconnect|Reconnect|Install|Pause|Resume|Restart)\s+([A-Za-z0-9_.-][A-Za-z0-9_.\s-]{0,48})$/,
+      fn: (m) => {
+        if (/\b(?:to|for|with|and|or|your|the|a|an|on|in|from)\b/i.test(m[2])) return null;
+        const aMap = { connect: '连接', disconnect: '断开连接', reconnect: '重新连接', install: '安装', pause: '暂停', resume: '恢复', restart: '重启' };
+        return `${ownLookup(aMap, m[1].toLowerCase()) || m[1]} ${m[2]}`;
+      },
+    },
+    {
+      re: /^Run\s+(.+?)\s+now$/i,
+      fn: (m) => (m[1].length <= 60 ? `立即运行 ${m[1]}` : null),
+    },
+    {
+      re: /^Review\s+permissions\s+for\s+(.+)$/i,
+      fn: (m) => `审阅 ${m[1]} 的权限`,
+    },
+    {
+      re: /^Set\s+up\s+(.+)$/i,
+      fn: (m) => (m[1].length <= 48 && !/\b(?:the|to|for|with|and|or)\b/i.test(m[1]) ? `配置 ${m[1]}` : null),
+    },
+    {
+      re: /^On\s+top\s+of\s+those\s+defaults,\s*(.+?)\s+requests\s+the\s+access\s+below\.?$/i,
+      fn: (m) => `除上述默认权限外，${m[1]} 还请求以下访问权限。`,
+    },
+    {
+      re: /^More\s+options\s+for\s+(.+)$/i,
+      fn: (m) => `${m[1]} 的更多选项`,
+    },
+    {
+      re: /^Back\s+to\s+(.+)$/i,
+      fn: (m) => {
+        if (m[1].length > 48) return null;
+        const t = dictLookup(m[1]) || m[1];
+        const sep = /^[\u4e00-\u9fff]/.test(t) ? '' : ' ';
+        return `返回${sep}${t}`;
+      },
+    },
+    {
+      re: /^Committed\s+to\s+(.+?)\.?$/i,
+      fn: (m) => `已提交至 ${m[1]}。`,
+    },
+    {
+      re: /^Pushed\s+to\s+(.+?)\.?$/i,
+      fn: (m) => `已推送至 ${m[1]}。`,
+    },
+    {
+      re: /^Publish(?:ed)?\s+(.+?)\s+to\s+origin\.?$/i,
+      fn: (m) => `${/^published/i.test(m[0]) ? '已将' : '将'} ${m[1]} 发布到 origin${/^published/i.test(m[0]) ? '。' : ''}`,
+    },
+    {
+      re: /^All\s+changes\s+since\s+(.+)$/i,
+      fn: (m) => `自 ${m[1]} 以来的所有更改`,
+    },
+    {
+      re: /^(.+?)\.\s*This\s+commit\s+is\s+already\s+pushed;\s*amending\s+will\s+require\s+a\s+force\s+push\.?$/i,
+      fn: (m) => `${dictLookup(m[1]) || m[1]}。此提交已推送至远程，追加修改将需要强制推送。`,
+    },
+    {
+      re: /^View\s+Diff\s+for\s+(.+)$/i,
+      fn: (m) => `查看 ${m[1]} 的差异`,
+    },
+    {
+      re: /^Turn\s+(\d+)$/i,
+      fn: (m) => `第 ${m[1]} 轮`,
+    },
+    {
+      re: /^Turns\s+(\d+)\s*[–-]\s*(\d+)$/i,
+      fn: (m) => `第 ${m[1]}–${m[2]} 轮`,
+    },
+    {
+      re: /^Open\s+image\s+(\d+)\s+of\s+(\d+)$/i,
+      fn: (m) => `打开第 ${m[1]} / ${m[2]} 张图片`,
+    },
+    {
+      re: /^Go\s+to\s+(page|slide)\s+(\d+)$/i,
+      fn: (m) => `跳转到第 ${m[2]} ${m[1].toLowerCase() === 'page' ? '页' : '张幻灯片'}`,
+    },
+    {
+      re: /^Page\s+(\d+)\s+failed\s+to\s+load$/i,
+      fn: (m) => `第 ${m[1]} 页加载失败`,
+    },
+    {
+      re: /^Failed\s+to\s+load\s+page\s+(\d+):\s*(.+)$/i,
+      fn: (m) => `加载第 ${m[1]} 页失败：${m[2]}`,
+    },
+    {
+      re: /^(Bounding\s+box|Comment|Search\s+match|Multiple\s+search\s+matches|Multiple\s+markers)\s+(on|near)\s+page\s+(\d+)$/i,
+      fn: (m) => {
+        const kMap = {
+          'bounding box': '边界框',
+          comment: '评论',
+          'search match': '搜索匹配项',
+          'multiple search matches': '多处搜索匹配项',
+          'multiple markers': '多个标记',
+        };
+        const prep = m[2].toLowerCase() === 'near' ? '附近' : '';
+        return `第 ${m[3]} 页${prep}的${ownLookup(kMap, m[1].toLowerCase().replace(/\s+/g, ' ')) || m[1]}`;
+      },
+    },
+    {
+      re: /^Scroll\s+to:\s*(.+?)\s+on\s+page\s+(\d+)$/i,
+      fn: (m) => `滚动至第 ${m[2]} 页：${m[1]}`,
+    },
+    {
+      re: /^Environment\s+paused\.\s*Click\s+to\s+resume\s+it\s+and\s+load\s+the\s+(.+?)\.?$/i,
+      fn: (m) => `环境已暂停，点击恢复以加载 ${dictLookup(m[1]) || m[1]}。`,
+    },
+    {
+      re: /^Cancel\s+Questionnaire\s+and\s+Stop\s+the\s+Agent\s+\((.+?)\)$/i,
+      fn: (m) => `取消问卷并停止智能体 (${m[1]})`,
+    },
+    {
+      re: /^Skip\s+\((.+?)\),\s*Skip\s+All\s+\((.+?)\)$/i,
+      fn: (m) => `跳过 (${m[1]})，全部跳过 (${m[2]})`,
+    },
+    {
+      re: /^Side\s+Question:\s*(.+)$/i,
+      fn: (m) => `旁路提问：${m[1]}`,
+    },
+    {
+      re: /^(Edit\s+side\s+question\s+title|Delete\s+side\s+question|Edit\s+comment):\s*(.+)$/i,
+      fn: (m) => {
+        const kMap = {
+          'edit side question title': '编辑旁路提问标题',
+          'delete side question': '删除旁路提问',
+          'edit comment': '编辑评论',
+        };
+        return `${ownLookup(kMap, m[1].toLowerCase().replace(/\s+/g, ' ')) || m[1]}：${m[2]}`;
+      },
+    },
+    {
+      re: /^(Reading|Read)\s+terminal:$/i,
+      fn: (m) => (m[1].toLowerCase() === 'reading' ? '正在读取终端：' : '已读取终端：'),
+    },
+    {
+      re: /^(Failed\s+to\s+execute|Executing|Executed)\s+notebook(\s+cells)?$/i,
+      fn: (m) => {
+        const target = m[2] ? ' Notebook 单元格' : ' Notebook';
+        const act = m[1].toLowerCase();
+        return act.startsWith('failed') ? `执行${target}失败` : act === 'executing' ? `正在执行${target}` : `已执行${target}`;
+      },
+    },
+    {
+      re: /^(Clicking|Clicked)\s+element\s+"(.+?)"$/i,
+      fn: (m) => `${m[1].toLowerCase() === 'clicking' ? '正在点击' : '已点击'}元素“${m[2]}”`,
+    },
+    {
+      re: /^Wants\s+to\s+run:\s*(.+)$/i,
+      fn: (m) => `请求运行：${m[1]}`,
+    },
+    {
+      re: /^(Sending|Sent|Rejected\s+sending|Suggested\s+sending)\s+(.+?)\s+to\s+command$/i,
+      fn: (m) => {
+        const aMap = {
+          sending: '正在向命令发送',
+          sent: '已向命令发送',
+          'rejected sending': '已拒绝向命令发送',
+          'suggested sending': '建议向命令发送',
+        };
+        return `${ownLookup(aMap, m[1].toLowerCase().replace(/\s+/g, ' ')) || m[1]} ${m[2]}`;
+      },
+    },
+    {
+      re: /^File\s+exceeds\s+the\s+([\d.]+)MB\s+display\s+limit\s+\(([\d.]+)MB\),\s*so\s+it\s+can't\s+be\s+opened\s+or\s+downloaded\s+here\.?$/i,
+      fn: (m) => `文件大小 (${m[2]}MB) 超过 ${m[1]}MB 显示上限，无法在此打开或下载。`,
+    },
+    {
+      re: /^Total\s+media\s+size\s+exceeds\s+([\d.]+)MB\s+limit$/i,
+      fn: (m) => `媒体总大小超过 ${m[1]}MB 上限`,
+    },
+    {
+      re: /^Failed\s+to\s+compress\s+image\s+to\s+fit\s+within\s+([\d.]+)MB$/i,
+      fn: (m) => `无法将图片压缩至 ${m[1]}MB 以内`,
+    },
+    {
+      re: /^Please\s+fill\s+in\s+all\s+required\s+fields:\s*(.+)$/i,
+      fn: (m) => `请填写所有必填字段：${m[1]}`,
+    },
+    {
+      re: /^Further\s+action\s+is\s+required\s+to\s+use\s+(.+)$/i,
+      fn: (m) => `需要完成进一步操作才能使用 ${m[1]}`,
+    },
+    {
+      re: /^Sorry,\s*this\s+account\s+is\s+ineligible\s+to\s+use\s+(.+)$/i,
+      fn: (m) => `抱歉，此账号不符合使用 ${m[1]} 的资格`,
+    },
+    {
+      re: /^Select\s+model\s+with\s+(.+)$/i,
+      fn: (m) => `按 ${m[1]} 选择模型`,
+    },
+    {
+      re: /^Cost\s+summary:\s*(.+)$/i,
+      fn: (m) => `费用摘要：${m[1]}`,
+    },
+    {
+      re: /^Open\s+URL\s+in\s+system\s+browser:\s*(.+)$/i,
+      fn: (m) => `在系统浏览器中打开 URL：${m[1]}`,
+    },
+    {
+      re: /^Line\s+(\d+)\s*→\s*(\d+)$/i,
+      fn: (m) => `第 ${m[1]} → ${m[2]} 行`,
+    },
+    {
+      re: /^Waiting\s+for\s+your\s+input:\s*(.+)$/i,
+      fn: (m) => `等待您的输入：${m[1]}`,
+    },
+    {
+      re: /^Honors\s+standard\s+VS\s+Code\s+shortcuts\s+without\s+collisions\s+\(e\.g\.\s*(.+?)\)\.?$/i,
+      fn: (m) => `遵循标准 VS Code 快捷键且无冲突（例如 ${m[1]}）。`,
+    },
+    {
+      re: /^(.+?),\s*showing\s+(\d+)\s+of\s+(\d+)$/i,
+      fn: (m) => `${dictLookup(m[1]) || translateString(m[1]) || m[1]}，当前显示 ${m[2]} / ${m[3]}`,
+    },
+    {
+      re: /^Tomorrow\s+(.+)$/i,
+      fn: (m) => (/\d/.test(m[1]) && m[1].length <= 32 ? `明天 ${m[1]}` : null),
     },
     // 通用文件动作兜底规则：置于全部具名动作规则之后，避开双引号及 URL 等非文件动作文案
     {
@@ -1748,13 +2547,31 @@
     'Tari',
     'Inter',
     'Google Sans',
-    'Legacy Light',
-    'Legacy Dark',
     'Fig',
     'Piper (g4)',
     'JJ',
     'Cog (GoB)',
     'Project 4K',
+    // v2.34.0 / v1.5.13 模型、代码语法主题与专有名词
+    'Gemini 2.5 Flash Image',
+    'Gemini 3 Pro Image',
+    'Gemini 3.1 Flash Image',
+    'Gemini Flash Next',
+    'ELMO Composite',
+    'Flash',
+    'Flash Lite',
+    'Pro',
+    'Sidecar',
+    'Catppuccin',
+    'Everforest',
+    'Gruvbox Material',
+    'One Light',
+    'One Dark Pro',
+    'Solarized Light',
+    'Solarized Dark',
+    'Tokyo Night',
+    'Bahasa Indonesia',
+    'Tiếng Việt',
   ]);
 
   function shouldSkipText(trimmed) {
@@ -1895,6 +2712,7 @@
     '[data-testid="file-title-name"], [data-testid="breadcrumb-segment"], [data-testid="branch-option"], ' +
     '[data-testid="fuzzy-match-highlight"], [data-testid="markdown-frontmatter"], [data-testid="terminal-surface"], ' +
     '[data-testid="sidecar-logs-content"], [data-testid="setup-script-output"], [data-testid="pdf-text-layer"], ' +
+    '[data-testid="pill-comment-anchor-text"], [data-testid="browser-url-display"], ' +
     '[data-testid="code-gutter"], [data-testid="code-gutter-diff"], [data-testid="row-gutter"], [data-no-translate]';
 
   // Built-in code/diff viewer line container (exclude text nodes, allow button aria-labels like Fold/Unfold)
@@ -1904,7 +2722,8 @@
   const CHAT_PROSE_SELECTOR =
     '[data-testid="planner-response-text"], [data-testid="user-input-step"], ' +
     '[data-testid="side-question-answer"], [data-testid="side-question-question"], ' +
-    '[data-testid="comment-card-text"]';
+    '[data-testid="comment-card-text"], [data-testid="automation-instructions-markdown"], ' +
+    '[data-testid="markdown-code-block-preview"]';
 
   const CHAT_UI_ALLOW_SELECTOR =
     'button, [role="button"], [role="menuitem"], .markdown-alert-title, ' +
@@ -1989,19 +2808,163 @@
     }
   }
 
-  // 根据所在容器上下文修正易歧义短词（如规划提示中的动词 "Type" 与表头名词 "Type" 区分）
-  function getContextualTranslation(raw, parent) {
+  // 根据所在容器上下文修正易歧义短词与 JSX 拆分节点（零全局短词污染）
+  function getContextualTranslation(raw, parent, node) {
     const trimmed = raw.trim();
-    if (!trimmed) return null;
-    if (trimmed === 'Type') {
+    const parentText = (parent.textContent || '').trim();
+    const isCommitChangesSpan =
+      /^(?:Commit|提交)\s*\d+\s*(?:file|个文件)\s*(?:changes?|更改)\s*(?:to|至)$/i.test(parentText);
+    if (!trimmed) {
+      if (raw === ' ' && isCommitChangesSpan) return '';
+      return null;
+    }
+    const lead = (raw.match(/^\s*/) || [''])[0];
+    const trail = (raw.match(/\s*$/) || [''])[0];
+    const wrap = (zh) => lead + zh + trail;
+
+    const closest = (sel) => {
       for (let p = parent; p; p = parentElementOrHost(p)) {
-        if (p.matches('[data-testid="plan-command-fyi-alert"]')) {
-          const lead = (raw.match(/^\s*/) || [''])[0];
-          const trail = (raw.match(/\s*$/) || [''])[0];
-          return lead + '输入' + trail;
-        }
+        if (p.matches && p.matches(sel)) return p;
+      }
+      return null;
+    };
+
+    // 1. 兼容旧版规划提示中的动词 "Type"（与表头名词 "Type" 区分）
+    if (trimmed === 'Type' && closest('[data-testid="plan-command-fyi-alert"]')) {
+      return wrap('输入');
+    }
+
+    // 2. "New" / "Beta" / "Legacy" 等模型与特性药丸徽章（含模型菜单内 a3 组件的 rounded-full 角标）
+    //    避免模型旁的 "New" 徽章落入 DICT["New"]="新建" 被误翻为“新建”
+    const isPillBadge =
+      (parent.tagName === 'DIV' && parent.classList && parent.classList.contains('rounded-full')) ||
+      (parent.tagName === 'SPAN' &&
+        (!!closest('div.rounded-full.bg-secondary, div.rounded-full[data-tooltip-id]') ||
+          !closest('button, [role="button"], [role="menuitem"]')));
+    if (isPillBadge) {
+      if (trimmed === 'New') return wrap('新');
+      if (trimmed === 'Beta') return wrap('测试版');
+      if (trimmed === 'Legacy') return wrap('旧版');
+    }
+
+    // 3. 思考强度档位与模型名称附带强度（仅限模型/编排器选择器及设置下拉内，杜绝全局短词误伤）
+    const inModelEffortContext =
+      !!closest(
+        '[data-testid^="model-selector-"], [data-testid="orchestrator-picker-effort"], ' +
+          '[data-testid="orchestrator-picker-row"], [data-testid="orchestrator-model"], ' +
+          '[data-testid="orchestrator-executor-model"]'
+      ) ||
+      !!(
+        parent.previousElementSibling &&
+        parent.previousElementSibling.matches &&
+        parent.previousElementSibling.matches('[data-testid="model-selector-effort-group"]')
+      );
+    if (inModelEffortContext) {
+      const effortTranslated = translateModelEffortText(trimmed);
+      if (effortTranslated && effortTranslated !== trimmed) {
+        return wrap(effortTranslated);
       }
     }
+
+    // 4. 自动化详情页摘要句："Runs [schedule] in [project] with [model] on this computer."
+    if (closest('[data-testid="automation-settings"]')) {
+      if (parent.tagName === 'P' && trimmed === 'Runs') return wrap('运行于');
+      if (parent.tagName === 'P' && trimmed === 'with') return wrap('使用');
+      if (trimmed === 'in') return wrap('位于');
+    }
+
+    // 5. 自动化定时编辑器内联介词与重复单位（仅限 schedule editor 内）
+    if (closest('[data-testid="automation-schedule-editor"]')) {
+      const schedMap = {
+        at: '时间',
+        on: '在',
+        'on the': '每月第',
+        hours: '小时',
+        week: '周',
+        month: '月',
+      };
+      const mapped = ownLookup(schedMap, trimmed);
+      if (mapped) return wrap(mapped);
+    }
+
+    // 6. 自动化空态："No automations yet" / "No automations match “q”."（防 DICT["No"]="否" 误翻）
+    if (closest('[data-testid="sidecar-list-empty"]')) {
+      if (trimmed === 'No' && node && node.nextSibling) {
+        return /\byet$/i.test(parentText) ? '暂无' : '没有';
+      }
+      if (trimmed === 'automations') return wrap('自动化任务');
+      if (trimmed === 'match “') return '匹配“';
+      if (trimmed === '”.') return '”。';
+      if (trimmed === 'yet') return '';
+    }
+
+    // 7. 通用拆分空态："No <projects|workspaces|automations> found"（兼容左邻节点先译后的连续遍历）
+    if (
+      node &&
+      /^(?:No|未找到)\s*(?:projects|workspaces|automations|项目|工作区|自动化任务)\s*(?:found)?$/i.test(
+        parentText
+      )
+    ) {
+      if (trimmed === 'No') return '未找到';
+      if (trimmed === 'projects') return '项目';
+      if (trimmed === 'workspaces') return '工作区';
+      if (trimmed === 'automations') return '自动化任务';
+      if (trimmed === 'found') return '';
+    }
+
+    // 8. 运行中面板选中计数条："{n} selected"
+    if (trimmed === 'selected' && closest('[data-testid="running-selection-bar"]')) {
+      return ' 项已选';
+    }
+
+    // 9. macOS 系统权限引导卡片拆分词
+    if (closest('[data-testid="computer-permissions-card"]')) {
+      const cpMap = { ', choose': '，选择', ', click': '，点击', ', then': '，然后', click: '点击' };
+      const mapped = ownLookup(cpMap, trimmed);
+      if (mapped) return wrap(mapped);
+    }
+
+    // 10. 条款与引导页内联 "and" 及 "says."
+    if (closest('[data-testid="post-onboarding-terms-body"], [data-testid="cloud-resource-disclosure-terms"]')) {
+      if (trimmed === 'and' && node && node.previousSibling && node.nextSibling) return wrap('和');
+      if (trimmed === 'says.') return '所提供的回答。';
+    }
+
+    // 11. 新建自动化重复校验："An automation with..."
+    if (closest('[data-testid="new-sidecar-modal"]')) {
+      if (trimmed === 'An' && node && node.nextSibling) {
+        const nextTxt = (node.nextSibling.nodeValue || node.nextSibling.textContent || '').trim();
+        if (nextTxt === 'automation' || nextTxt === '自动化任务') {
+          return '';
+        }
+      }
+      if (trimmed === 'automation') return '自动化任务';
+    }
+
+    // 12. 数字拆分分页："N of M"（如 card-deck-counter）
+    if (trimmed === 'of' && node && node.previousSibling && node.nextSibling) {
+      const pTxt = (node.previousSibling.textContent || node.previousSibling.nodeValue || '').trim();
+      const nTxt = (node.nextSibling.textContent || node.nextSibling.nodeValue || '').trim();
+      if (/^\d+$/.test(pTxt) && /^\d+$/.test(nTxt)) return ' / ';
+    }
+
+    // 13. 紧随数字的拆分计数名词与 Git 提交弹窗拆分句
+    if (node && node.previousSibling) {
+      const pTxt = (node.previousSibling.textContent || node.previousSibling.nodeValue || '').trim();
+      if (/\d$/.test(pTxt)) {
+        if (trimmed === 'subagents') return ' 个子智能体';
+        if (trimmed === 'lines' || trimmed === 'line') return lead + '行' + trail;
+        if (trimmed === 'plugins' || trimmed === 'plugin') return ' 个插件';
+        if (trimmed === 'images' || trimmed === 'image') return ' 张图片';
+        if (trimmed === 'results' || trimmed === 'result') return ' 个结果';
+      }
+    }
+    if (isCommitChangesSpan) {
+      if (trimmed === 'file') return ' 个文件';
+      if (trimmed === 'change' || trimmed === 'changes') return '更改';
+      if (trimmed === 'to') return '至';
+    }
+
     return null;
   }
 
@@ -2052,7 +3015,7 @@
     const parent = parentElementOrHost(node);
     if (!parent || isTextParentExcluded(parent)) return;
 
-    let translated = getContextualTranslation(val, parent);
+    let translated = getContextualTranslation(val, parent, node);
     if (translated === null) {
       translated = getSplitJsxNodeTranslation(val, node, parent);
     }

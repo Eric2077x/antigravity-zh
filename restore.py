@@ -26,6 +26,7 @@ ASAR_FILE = os.path.join(RESOURCES_DIR, "app.asar")
 ASAR_DISABLED = os.path.join(RESOURCES_DIR, "app.asar.disabled")
 UNPACKED_APP_DIR = os.path.join(RESOURCES_DIR, "app")
 STAGING_APP_DIR = os.path.join(RESOURCES_DIR, "app.staging")
+BACKUP_APP_DIR = os.path.join(RESOURCES_DIR, "app.old")
 SHA256_STATE_FILE = os.path.join(RESOURCES_DIR, ".zh_asar_sha256")
 
 BIN_DIR = os.path.join(RESOURCES_DIR, "bin")
@@ -189,7 +190,7 @@ def restore_antigravity_app(uid: int, gid: int) -> None:
         if os.geteuid() == 0 and uid != 0 and os.path.exists(ASAR_FILE):
             os.chown(ASAR_FILE, uid, gid)
 
-    for dir_path in (STAGING_APP_DIR, UNPACKED_APP_DIR):
+    for dir_path in (STAGING_APP_DIR, BACKUP_APP_DIR, UNPACKED_APP_DIR):
         if os.path.isdir(dir_path) and not os.path.islink(dir_path):
             print(f"正在删除解包目录 {os.path.basename(dir_path)}...")
             shutil.rmtree(dir_path)
@@ -245,12 +246,12 @@ def restore_gemini_agy(uid: int, gid: int, home_dir: str) -> bool:
             raise
     elif os.path.isfile(GEMINI_AGY_BIN):
         verify = subprocess.run(
-            ["codesign", "--verify", "--strict", GEMINI_AGY_BIN],
+            ["/usr/bin/codesign", "--verify", "--strict", "-R", GOOGLE_SIGNING_REQ, GEMINI_AGY_BIN],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
         if verify.returncode != 0:
-            print("警告: 未找到 gemini_agy.orig 备份，且当前 Gemini.app/Contents/Helpers/agy 签名校验异常。")
+            print("警告: 未找到 gemini_agy.orig 备份，且当前 Gemini.app/Contents/Helpers/agy 并非官方 Google 签名。")
 
     for legacy_file in (
         LEGACY_GEMINI_AGY_ORIG,

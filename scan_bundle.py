@@ -55,26 +55,39 @@ SETTINGS_FIELDS = (
     "tooltip",
     "subtext",
     "emptyText",
+    "emptyMessage",
     "heading",
+    "header",
+    "sectionTitle",
     "helperText",
+    "confirmLabel",
+    "cancelLabel",
+    "summary",
+    "ariaLabel",
     "aria-label",
+    "aria-valuetext",
     "data-tooltip",
+    "data-tooltip-content",
     "data-placeholder",
 )
 
+_FIELD_ALT = "|".join(re.escape(k) for k in SETTINGS_FIELDS)
 FIELD_KV_RE = re.compile(
     r"""(?:['"])?(?P<field>"""
-    + "|".join(re.escape(k) for k in SETTINGS_FIELDS)
-    + r""")(?:['"])?\s*:\s*(?P<q>["'])(?P<text>(?:\\.|(?!\2)[^\\\r\n]){2,500})(?P=q)"""
+    + _FIELD_ALT
+    + r""")(?:['"])?\s*:\s*(?:"(?P<dtext>(?:\\.|[^"\\\r\n]){2,500})"|'(?P<stext>(?:\\.|[^'\\\r\n]){2,500})')"""
 )
 OPTIONS_LABEL_RE = re.compile(
     r"""options\s*:\s*\[(?P<body>[^\[\]]{1,4000})\]"""
 )
-CREATE_ELEM_CHILD_RE = re.compile(
-    r"""\.createElement\([^,\n]{1,60},\s*(?:null|\{[^}\n]{0,300}\})\s*,\s*(?P<q>["'])(?P<text>(?:\\.|[^"'\\\r\n]){2,240})(?P=q)"""
+OPTIONS_ITEM_RE = re.compile(
+    r"""(?:label|title)\s*:\s*(?:"(?P<dtext>(?:\\.|[^"\\\r\n]){1,120})"|'(?P<stext>(?:\\.|[^'\\\r\n]){1,120})')"""
 )
-TEMPLATE_RE = re.compile(r"""`(?P<text>(?:\\.|[^`\\\r\n]){3,240})`""")
-PLAIN_STR_RE = re.compile(r"""(?P<q>["'])(?P<text>[A-Z][A-Za-z0-9 .,?!:;'"/()\-–—%+\u2026]{1,180})(?P=q)""")
+PLAIN_STR_RE = re.compile(
+    r'''"(?P<dtext>[A-Z][A-Za-z0-9 .,?!:;'()/\\\-–—%+\u2026]{1,180})"|'(?P<stext>[A-Z][A-Za-z0-9 .,?!:;"()/\\\-–—%+\u2026]{1,180})' '''.strip()
+)
+CREATE_ELEM_CALL_RE = re.compile(r"""\.createElement\(""")
+THIRD_PARTY_NOISE_RE = re.compile(r"""KaTeX|katex|AbstractBarycenter|ELKLayout|elkjs|;base64,""")
 
 SKIP_RE = re.compile(
     r"""^(?:https?://|file://|/|~|--[a-z0-9-]+|[A-Za-z0-9_]+\.[a-z]{2,5}$|[a-z]+(?:[A-Z][a-z0-9]+)+$|[A-Z0-9_]{2,}$|#[0-9a-fA-F]{3,8}$|\d+[%pxremvhw]*$)"""
@@ -141,8 +154,209 @@ def read_live_main_js() -> str:
     return urllib.request.urlopen(url, timeout=10).read().decode("utf-8", errors="replace")
 
 
+def _extract_first_party_ui_text(js_text: str, radius: int = 40) -> str:
+    """聚焦距 .createElement( ±radius 行内的第一方 UI 代码段，剔除超长 proto/base64 与 KaTeX/ELK 噪音。"""
+    lines = js_text.splitlines()
+    n = len(lines)
+    keep = [False] * n
+    for i, ln in enumerate(lines):
+        if len(ln) > 20000 or THIRD_PARTY_NOISE_RE.search(ln):
+            continue
+        if ".createElement(" in ln:
+            lo = max(0, i - radius)
+            hi = min(n, i + radius + 1)
+            for j in range(lo, hi):
+                if len(lines[j]) <= 20000 and not THIRD_PARTY_NOISE_RE.search(lines[j]):
+                    keep[j] = True
+    return "\n".join(lines[i] for i in range(n) if keep[i])
+
+
+def _scan_js_string(text: str, start: int) -> tuple[str, int]:
+    """从引号起始位置扫描单/双引号 JS 字符串，返回 (原始字面量内容, 结束引号后的索引)。"""
+    q = text[start]
+    i = start + 1
+    n = len(text)
+    buf: list[str] = []
+    while i < n:
+        ch = text[i]
+        if ch == "\\" and i + 1 < n:
+            buf.append(ch)
+            buf.append(text[i + 1])
+            i += 2
+            continue
+        if ch == q:
+            return "".join(buf), i + 1
+        if ch in ("\r", "\n"):
+            return "", i
+        buf.append(ch)
+        i += 1
+    return "", n
+
+
+def _extract_create_element_children(js_text: str) -> set[str]:
+    """用括号配平解析 .createElement(...) 的第 3 个及后续参数（覆盖多子节点、嵌套 props 与三元分支）。"""
+    out: set[str] = set()
+    n = len(js_text)
+    for m in CREATE_ELEM_CALL_RE.finditer(js_text):
+        i = m.end()
+        limit = min(n, i + 4000)
+        paren = 1
+        brace = 0
+        bracket = 0
+        arg_idx = 0
+        while i < limit and paren > 0:
+            ch = js_text[i]
+            if ch in ("'", '"'):
+                lit, nxt = _scan_js_string(js_text, i)
+                if arg_idx >= 2 and paren == 1 and brace == 0 and bracket == 0 and 2 <= len(lit) <= 240:
+                    txt = _decode_js_escapes(lit)
+                    if _is_candidate_ui_text(txt, allow_short=True):
+                        out.add(txt)
+                i = nxt
+                continue
+            if ch == "`":
+                i += 1
+                t_brace = 0
+                while i < limit:
+                    tc = js_text[i]
+                    if tc == "\\" and i + 1 < limit:
+                        i += 2
+                        continue
+                    if tc == "$" and i + 1 < limit and js_text[i + 1] == "{":
+                        t_brace += 1
+                        i += 2
+                        continue
+                    if tc == "}" and t_brace > 0:
+                        t_brace -= 1
+                        i += 1
+                        continue
+                    if tc == "`" and t_brace == 0:
+                        i += 1
+                        break
+                    i += 1
+                continue
+            if ch == "(":
+                paren += 1
+            elif ch == ")":
+                paren -= 1
+            elif ch == "{":
+                brace += 1
+            elif ch == "}":
+                brace = max(0, brace - 1)
+            elif ch == "[":
+                bracket += 1
+            elif ch == "]":
+                bracket = max(0, bracket - 1)
+            elif ch == "," and paren == 1 and brace == 0 and bracket == 0:
+                arg_idx += 1
+            i += 1
+    return out
+
+
+def _extract_template_literals(js_text: str) -> list[str]:
+    """按 ${...} 栈深度扫描模板字面量，避免内部嵌套反引号提前截断。"""
+    results: list[str] = []
+    n = len(js_text)
+    i = 0
+    while i < n:
+        ch = js_text[i]
+        if ch in ("'", '"'):
+            _, i = _scan_js_string(js_text, i)
+            continue
+        if ch != "`":
+            i += 1
+            continue
+        start = i + 1
+        i += 1
+        expr_depth = 0
+        nested_backticks: list[int] = []
+        valid = True
+        while i < n:
+            c = js_text[i]
+            if c == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if expr_depth > 0 and c in ("'", '"'):
+                _, i = _scan_js_string(js_text, i)
+                continue
+            if c == "$" and i + 1 < n and js_text[i + 1] == "{":
+                expr_depth += 1
+                i += 2
+                continue
+            if c == "}" and expr_depth > 0:
+                if not nested_backticks or expr_depth > nested_backticks[-1]:
+                    expr_depth -= 1
+                i += 1
+                continue
+            if c == "`":
+                if expr_depth == 0:
+                    raw = js_text[start:i]
+                    if 3 <= len(raw) <= 320 and "\n" not in raw and "\r" not in raw and "${" in raw:
+                        results.append(raw)
+                    i += 1
+                    break
+                if nested_backticks and nested_backticks[-1] == expr_depth:
+                    nested_backticks.pop()
+                else:
+                    nested_backticks.append(expr_depth)
+                i += 1
+                continue
+            if i - start > 360:
+                valid = False
+                break
+            i += 1
+        if not valid:
+            i += 1
+    return results
+
+
+def _normalize_template_exprs(raw: str) -> str:
+    """将含嵌套花括号的 ${...} 表达式按语义归一化为占位符（计数类映射为 2）。"""
+    out: list[str] = []
+    i = 0
+    n = len(raw)
+    while i < n:
+        if raw[i] == "$" and i + 1 < n and raw[i + 1] == "{":
+            j = i + 2
+            depth = 1
+            while j < n and depth > 0:
+                if raw[j] == "\\" and j + 1 < n:
+                    j += 2
+                    continue
+                if raw[j] == "{":
+                    depth += 1
+                elif raw[j] == "}":
+                    depth -= 1
+                j += 1
+            expr = raw[i + 2 : j - 1]
+            head = raw[:i]
+            tail = raw[j:]
+            if (
+                re.match(
+                    r"\s*(?:tokens?|commits?|steps?|files?|items?|plugins?|conversations?|comments?|overrides?|breakdowns?|subagents?|references|cookies?|accounts?|timers?|folders?|days?|seconds?|minutes?|hours?|turns?|ms|s|MB|KB|%)\b",
+                    tail,
+                    re.I,
+                )
+                or re.search(
+                    r"\b(?:Question|Step|Turn|Page|Slide|Version|code|port|attempt|last|latest)\s+$",
+                    head,
+                    re.I,
+                )
+                or any(tok in expr for tok in (".length", "numTokens", "size", "count", "Count", "total", "Total"))
+            ):
+                out.append("2")
+            else:
+                out.append("Item")
+            i = j
+        else:
+            out.append(raw[i])
+            i += 1
+    return "".join(out)
+
+
 def extract_candidates(js_text: str) -> dict[str, list[str]]:
     """分类提取设置表字段、JSX 子文本、模板字符串与常规 UI 文本。"""
+    ui_scope = _extract_first_party_ui_text(js_text)
     field_strings: dict[str, set[str]] = {
         "settings_fields": set(),
         "jsx_children": set(),
@@ -150,54 +364,32 @@ def extract_candidates(js_text: str) -> dict[str, list[str]]:
         "ui_strings": set(),
     }
 
-    for m in FIELD_KV_RE.finditer(js_text):
-        txt = _decode_js_escapes(m.group("text"))
+    for m in FIELD_KV_RE.finditer(ui_scope):
+        raw_txt = m.group("dtext") if m.group("dtext") is not None else m.group("stext")
+        txt = _decode_js_escapes(raw_txt or "")
         if _is_candidate_ui_text(txt, allow_short=True):
             field_strings["settings_fields"].add(txt)
 
-    for om in OPTIONS_LABEL_RE.finditer(js_text):
-        for lm in re.finditer(r"""(?:label|title)\s*:\s*(?P<q>["'])(?P<text>(?:\\.|[^"'\\\r\n]){1,120})(?P=q)""", om.group("body")):
-            txt = _decode_js_escapes(lm.group("text"))
+    for om in OPTIONS_LABEL_RE.finditer(ui_scope):
+        for lm in OPTIONS_ITEM_RE.finditer(om.group("body")):
+            raw_txt = lm.group("dtext") if lm.group("dtext") is not None else lm.group("stext")
+            txt = _decode_js_escapes(raw_txt or "")
             if _is_candidate_ui_text(txt, allow_short=True):
                 field_strings["settings_fields"].add(txt)
 
-    for m in CREATE_ELEM_CHILD_RE.finditer(js_text):
-        txt = _decode_js_escapes(m.group("text"))
-        if _is_candidate_ui_text(txt, allow_short=True):
-            field_strings["jsx_children"].add(txt)
+    field_strings["jsx_children"].update(_extract_create_element_children(ui_scope))
 
-    for m in TEMPLATE_RE.finditer(js_text):
-        raw = m.group("text")
-        if "${" not in raw:
-            continue
-        # 将插值归一化为可探测占位的示例文本，计数类表达式占位为 "2" 以避免正则检测假阳性
-        def _tpl_placeholder(match: re.Match) -> str:
-            expr = match.group(0)[2:-1]
-            head = raw[: match.start()]
-            tail = raw[match.end() :]
-            if (
-                re.match(
-                    r"\s*(?:tokens?|commits?|steps?|files?|items?|plugins?|conversations?|comments?|overrides?|breakdowns?|subagents?|references|seconds?|minutes?|hours?|days?|ms|s|MB|KB|%)\b",
-                    tail,
-                    re.I,
-                )
-                or re.search(
-                    r"\b(?:Question|Step|Turn|Page|Slide|Version|code|port|attempt)\s+$",
-                    head,
-                    re.I,
-                )
-                or any(tok in expr for tok in (".length", "numTokens", "size", "count"))
-            ):
-                return "2"
-            return "Item"
-
-        normalized = re.sub(r"\$\{[^}]+\}", _tpl_placeholder, raw)
+    for raw in _extract_template_literals(ui_scope):
+        normalized = _normalize_template_exprs(raw)
         txt = _decode_js_escapes(normalized)
-        if _is_candidate_ui_text(txt) and not any(tok in raw for tok in ("http", "rgb(", "rgba(", "className", "Error:", "console.")):
+        if _is_candidate_ui_text(txt) and not any(
+            tok in raw for tok in ("http", "rgb(", "rgba(", "className", "Error:", "console.")
+        ):
             field_strings["templates"].add(f"{txt}  <<<  `{raw}`")
 
-    for m in PLAIN_STR_RE.finditer(js_text):
-        txt = _decode_js_escapes(m.group("text"))
+    for m in PLAIN_STR_RE.finditer(ui_scope):
+        raw_txt = m.group("dtext") if m.group("dtext") is not None else m.group("stext")
+        txt = _decode_js_escapes(raw_txt or "")
         if _is_candidate_ui_text(txt) and txt not in field_strings["settings_fields"]:
             field_strings["ui_strings"].add(txt)
 
@@ -283,7 +475,10 @@ def check_coverage(cat_map: dict[str, list[str]], zh_data: dict) -> tuple[dict[s
         for it in items:
             sample, _ = _normalize_template_sample(it)
             stats["total"] += 1
-            if sample in exact or any(sample.startswith(f) for f in fragments):
+            if sample in exact or any(
+                sample == f or (sample.startswith(f) and re.match(r"^\s*[:：]", sample[len(f) :]))
+                for f in fragments
+            ):
                 stats["covered_dict"] += 1
                 continue
             if engine_hits is not None and engine_hits.get(sample):
