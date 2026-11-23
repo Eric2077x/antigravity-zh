@@ -1,0 +1,51 @@
+name: "CI"
+
+on:
+  push:
+    branches:
+      - "main"
+  pull_request:
+    branches:
+      - "main"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: "ci-${{ github.ref }}"
+  cancel-in-progress: true
+
+jobs:
+  regression-tests:
+    name: "macOS (Python ${{ matrix.python-version }})"
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version:
+          - "3.9"
+          - "3.12"
+    steps:
+      - name: "检出仓库代码"
+        uses: actions/checkout@v4
+
+      - name: "配置 Python ${{ matrix.python-version }}"
+        uses: actions/setup-python@v5
+        with:
+          python-version: "${{ matrix.python-version }}"
+
+      - name: "配置 Node.js 20"
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: "校验前端引擎语法并运行 DOM 隔离回归测试"
+        run: |
+          node --check engine/dom-translator.js
+          node tests/test_dom_isolation.js
+
+      - name: "运行零依赖 Python 回归与合规门禁测试"
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python3 -m unittest discover -s tests -v

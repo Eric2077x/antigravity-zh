@@ -1,6 +1,11 @@
 # Antigravity & Gemini.app 双端简体中文汉化补丁 (macOS)
 
-专为 macOS 版 **Antigravity**（适配 `v2.15+` ~ `v2.34+` Electron 主进程与 Webview）以及 **Gemini.app 内置 Antigravity**（`Contents/Helpers/agy`，兼容 `agy 1.5.13+`）设计的无损、原生级、防更新掉落双端简体中文汉化工具。
+[![CI](https://github.com/Eric2077x/antigravity-zh/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Eric2077x/antigravity-zh/actions/workflows/ci.yml)
+![Platform](https://img.shields.io/badge/platform-macOS-black)
+![Python](https://img.shields.io/badge/python-3.7%2B-blue)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
+专为 macOS 版 **Antigravity**（适配 `v2.15+` ~ `v2.34+` Electron 主进程与 Webview）以及 **Gemini.app 内置 Antigravity**（`Contents/Helpers/agy`，兼容 `agy 1.5.14+`）设计的无损、原生级、防更新掉落双端简体中文汉化工具。
 
 ## 核心特性与安全架构
 
@@ -24,6 +29,7 @@
 
 ```text
 antigravity-zh/
+├── .github/workflows/ci.yml    # GitHub Actions macOS 自动测试工作流（Python 3.9 / 3.12 + Node）
 ├── patcher.py                  # 双端安装、更新同步与 --guard 巡检主程序
 ├── restore.py                  # 双端一键无损还原与残留清理脚本
 ├── scan_bundle.py              # 前端、Electron bundle 与 Swarm 面板词条扫描审计脚本
