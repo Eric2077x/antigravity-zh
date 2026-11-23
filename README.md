@@ -1,6 +1,7 @@
 # Antigravity & Gemini.app 双端简体中文汉化补丁 (macOS)
 
 [![CI](https://github.com/Eric2077x/antigravity-zh/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Eric2077x/antigravity-zh/actions/workflows/ci.yml)
+![Antigravity](https://img.shields.io/badge/Antigravity-2.34.0%2B-4285F4)
 ![Platform](https://img.shields.io/badge/platform-macOS-black)
 ![Python](https://img.shields.io/badge/python-3.7%2B-blue)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
