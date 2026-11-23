@@ -2435,6 +2435,143 @@
       re: /^Tomorrow\s+(.+)$/i,
       fn: (m) => (/\d/.test(m[1]) && m[1].length <= 32 ? `明天 ${m[1]}` : null),
     },
+    // Swarm 伴生面板（plugin://swarm--swarm_board-*）真实动态模板规则
+    {
+      re: /^(\d+)\s+posts?\s*·\s*(\d+)\s+members?$/i,
+      fn: (m) => `${m[1]} 条消息 · ${m[2]} 名成员`,
+    },
+    {
+      re: /^(\d+)\s+of\s+(\d+)\s+tasks?\s+done$/i,
+      fn: (m) => `已完成 ${m[1]} / ${m[2]} 项任务`,
+    },
+    {
+      re: /^(\d+)\s+of\s+(\d+)\s+done$/i,
+      fn: (m) => `已完成 ${m[1]} / ${m[2]}`,
+    },
+    {
+      re: /^Coordinator\s*·\s*(\d+)\s+of\s+(\d+)\s+done(?:\s*·\s*(.+))?$/i,
+      fn: (m) => {
+        const tail = m[3] ? ` · ${dictLookup(m[3].trim()) || m[3].trim()}` : '';
+        return `协调器 · 已完成 ${m[1]} / ${m[2]}${tail}`;
+      },
+    },
+    {
+      re: /^(\d+)\s+frames?\s*([·,])\s*(\d+(?:\.\d+)?\s*(?:B|KB|MB|GB))$/i,
+      fn: (m) => `${m[1]} 帧${m[2] === ',' ? '，' : ' · '}${m[3]}`,
+    },
+    {
+      re: /^@([A-Za-z0-9_.-]+)\s+hit an error$/,
+      fn: (m) => `@${m[1]} 发生错误`,
+    },
+    {
+      re: /^@([A-Za-z0-9_.-]+)\s+looks stuck$/,
+      fn: (m) => `@${m[1]} 疑似卡住`,
+    },
+    {
+      re: /^@([A-Za-z0-9_.-]+)\s+ran out of quota$/,
+      fn: (m) => `@${m[1]} 配额已耗尽`,
+    },
+    {
+      re: /^Go to #(\d+) on the Board$/,
+      fn: (m) => `跳转到公告板 #${m[1]}`,
+    },
+    {
+      re: /^(.+?)\s*\(not on the roster\)$/,
+      fn: (m) => `${m[1]}（未在名单中）`,
+    },
+    {
+      re: /^#([A-Za-z0-9_.-]+)\s+is archived:\s*this addresses nobody$/,
+      fn: (m) => `#${m[1]} 已归档：此消息不会通知任何人`,
+    },
+    {
+      re: /^(.+?)\s*·\s*(\d+)\s+machines?$/,
+      fn: (m) => `${dictLookup(m[1].trim()) || m[1].trim()} · ${m[2]} 台设备`,
+    },
+    {
+      re: /^(.+?)\s*·\s*(connecting|reconnecting|unavailable)$/i,
+      fn: (m) => {
+        const map = { connecting: '连接中', reconnecting: '重新连接中', unavailable: '不可用' };
+        const st = ownLookup(map, m[2].toLowerCase()) || m[2];
+        return `${dictLookup(m[1].trim()) || m[1].trim()} · ${st}`;
+      },
+    },
+    // v1.5.14 新增高频动态模板规则
+    {
+      re: /^Move this conversation to "(.+)"\?$/,
+      fn: (m) => `要将此对话移至“${m[1]}”吗？`,
+    },
+    {
+      re: /^Move to (Workspace|Project)$/,
+      fn: (m) => `移至${m[1] === 'Workspace' ? '工作区' : '项目'}`,
+    },
+    {
+      re: /^Remove from (Workspace|Project)$/,
+      fn: (m) => `从${m[1] === 'Workspace' ? '工作区' : '项目'}中移除`,
+    },
+    {
+      re: /^Pin Entire (Workspace|Project)$/,
+      fn: (m) => `置顶整个${m[1] === 'Workspace' ? '工作区' : '项目'}`,
+    },
+    {
+      re: /^(\d+)\s+models?\s+selected$/i,
+      fn: (m) => `已选择 ${m[1]} 个模型`,
+    },
+    {
+      re: /^Closed\s+(\d+)\s+terminals?$/i,
+      fn: (m) => `已关闭 ${m[1]} 个终端`,
+    },
+    {
+      re: /^Playback speed\s+(\d+(?:\.\d+)?)x$/i,
+      fn: (m) => `播放速度 ${m[1]} 倍`,
+    },
+    {
+      re: /^Zoom\s+(\d+)%,\s*reset to fit$/i,
+      fn: (m) => `缩放 ${m[1]}%，点击重置为适应窗口`,
+    },
+    {
+      re: /^The folder “(.+)” does not exist\. Would you like to create it\?$/,
+      fn: (m) => `文件夹“${m[1]}”不存在，是否立即创建？`,
+    },
+    {
+      re: /^“(.+)” isn’t a valid folder name\.$/,
+      fn: (m) => `“${m[1]}”不是有效的文件夹名称。`,
+    },
+    {
+      re: /^Can’t create this path — “(.+)” is a file, not a folder\.$/,
+      fn: (m) => `无法创建此路径——“${m[1]}”是文件而非文件夹。`,
+    },
+    {
+      re: /^Branch\s+(.+)\s+no longer exists$/,
+      fn: (m) => `分支 ${m[1]} 已不存在`,
+    },
+    {
+      re: /^MCP server\s+(.+)\s+requires authentication$/,
+      fn: (m) => `MCP 服务器 ${m[1]} 需要身份验证`,
+    },
+    {
+      re: /^Retrying transcription \(attempt (\d+)\)…$/,
+      fn: (m) => `正在重试转录（第 ${m[1]} 次）…`,
+    },
+    {
+      re: /^Recording exceeds 15MB limit \((.+)\)$/,
+      fn: (m) => `录音超出 15MB 上限（当前 ${m[1]}）`,
+    },
+    {
+      re: /^Searching as\s+(.+)$/,
+      fn: (m) => `当前搜索身份：${m[1]}`,
+    },
+    {
+      re: /^(\d+)\s+tools?\s+in this MCP server \((.+?)\s+tokens?\) exceeded the customization budget and (?:was|were) excluded from context\.$/,
+      fn: (m) => `此 MCP 服务器中有 ${m[1]} 个工具（${m[2]} Token）超出自定义项预算，已从上下文中排除。`,
+    },
+    {
+      re: /^This deletes\s+(\d+)\s+call recordings?\s+\((.+?)\)\s+from your machine\. You can't undo this\.$/,
+      fn: (m) => `此操作将从本机删除 ${m[1]} 条通话录音（${m[2]}），且无法撤销。`,
+    },
+    {
+      re: /^Can't access "(.+?)"\. macOS privacy settings are blocking Antigravity from this location\. Allow Antigravity in System Settings > Privacy & Security > Files and Folders \(or Full Disk Access\)\.?$/,
+      fn: (m) => `无法访问“${m[1]}”。macOS 隐私设置正在阻止 Antigravity 访问此位置，请在「系统设置 > 隐私与安全性 > 文件与文件夹（或完全磁盘访问权限）」中允许 Antigravity。`,
+    },
     // 通用文件动作兜底规则：置于全部具名动作规则之后，避开双引号及 URL 等非文件动作文案
     {
       re: /^(Viewed|Read|Edited|Created|Deleted|Updated|Wrote|Analyzed|Checked)\s+(.+?)(?:\s+\(lines?\s+(\d+(?:-\d+)?)\))?$/,
@@ -2572,6 +2709,19 @@
     'Tokyo Night',
     'Bahasa Indonesia',
     'Tiếng Việt',
+    'Dansk',
+    'Deutsch',
+    'Español',
+    'Français',
+    'Italiano',
+    'Nederlands',
+    'Norsk',
+    'Polski',
+    'Português',
+    'Română',
+    'Suomi',
+    'Svenska',
+    'Türkçe',
   ]);
 
   function shouldSkipText(trimmed) {
@@ -2704,7 +2854,7 @@
     'NOSCRIPT',
   ]);
 
-  // Subtrees that contain user code, editors, terminals, Lexical state, filenames, fuzzy highlights, or logs
+  // Subtrees that contain user code, editors, terminals, Lexical state, filenames, fuzzy highlights, logs, or Swarm agent content
   const SUBTREE_REJECT_SELECTOR =
     'pre, code, kbd, samp, var, script, style, svg, ' +
     '.monaco-editor, .monaco-keybinding, .keybinding-label, .xterm, .cm-editor, .ProseMirror, ' +
@@ -2713,21 +2863,62 @@
     '[data-testid="fuzzy-match-highlight"], [data-testid="markdown-frontmatter"], [data-testid="terminal-surface"], ' +
     '[data-testid="sidecar-logs-content"], [data-testid="setup-script-output"], [data-testid="pdf-text-layer"], ' +
     '[data-testid="pill-comment-anchor-text"], [data-testid="browser-url-display"], ' +
-    '[data-testid="code-gutter"], [data-testid="code-gutter-diff"], [data-testid="row-gutter"], [data-no-translate]';
+    '[data-testid="code-gutter"], [data-testid="code-gutter-diff"], [data-no-translate], ' +
+    '[data-testid="swarm-board"] .msg-body, [data-testid="swarm-board"] .msg-author, ' +
+    '[data-testid="swarm-board"] .msg-who, [data-testid="swarm-board"] .msg-to, ' +
+    '[data-testid="swarm-board"] .mention, [data-testid="swarm-board"] .chip-name, ' +
+    '[data-testid="swarm-board"] .node-label, [data-testid="swarm-board"] .ov-who, ' +
+    '[data-testid="swarm-board"] .sys-text, [data-testid="swarm-board"] .raw-meta .path, ' +
+    '[data-testid="swarm-board"] .o2-mauth, [data-testid="swarm-board"] .o2-mrole, ' +
+    '[data-testid="swarm-board"] .o2-mnow, [data-testid="swarm-board"] .o2-donem, ' +
+    '[data-testid="swarm-board"] .o2-goal, [data-testid="swarm-board"] .o2-runt, ' +
+    '[data-testid="swarm-board"] .o2-runsum, [data-testid="swarm-board"] .o2-runnote, ' +
+    '[data-testid="swarm-board"] .o2-sttxt, [data-testid="swarm-board"] .hv-nm';
 
   // Built-in code/diff viewer line container (exclude text nodes, allow button aria-labels like Fold/Unfold)
   const CODE_LINE_SELECTOR = '.code-line, [data-line-number]';
 
-  // Conversation prose containers (protect AI markdown & user prompts, but allow inner UI buttons/menus)
+  // Conversation prose & voice transcript containers (protect AI markdown, user prompts & transcripts, while allowing inner UI buttons/menus)
   const CHAT_PROSE_SELECTOR =
     '[data-testid="planner-response-text"], [data-testid="user-input-step"], ' +
     '[data-testid="side-question-answer"], [data-testid="side-question-question"], ' +
+    '[data-testid="side-question-followup-user"], [data-testid="transcript-line-text"], ' +
     '[data-testid="comment-card-text"], [data-testid="automation-instructions-markdown"], ' +
-    '[data-testid="markdown-code-block-preview"]';
+    '[data-testid="markdown-code-block-preview"], ' +
+    '[data-testid="conversation-view"] [data-markdown-root], ' +
+    '[data-testid="agent-response"] [data-markdown-root], ' +
+    '[data-testid="user-message"] [data-markdown-root], ' +
+    '[data-testid="live-transcript"] [data-markdown-root], ' +
+    '[data-testid="voice-transcript-card"] [data-markdown-root], ' +
+    '[data-testid="side-question-tab-conversation"] [data-markdown-root], ' +
+    '[data-testid="subagent-tab-conversation"] [data-markdown-root]';
 
   const CHAT_UI_ALLOW_SELECTOR =
     'button, [role="button"], [role="menuitem"], .markdown-alert-title, ' +
+    '[data-testid="user-message-actions"], ' +
     '[data-testid="markdown-table-copy-markdown"], [data-testid="markdown-table-width-toggle"], [data-testid="markdown-table-menu"]';
+
+  // 仅允许翻译固定系统占位标题/分组名，其余用户自定义会话名、项目名与 Swarm 标题保持原文
+  const USER_TITLE_TEXT_SELECTOR =
+    '[data-testid^="conversation-row-"] span.truncate.text-left.w-full, ' +
+    '[data-testid="project-header"] span.truncate, ' +
+    '[data-testid="swarm-title"]';
+
+  const SYSTEM_PLACEHOLDER_TITLES = new Set([
+    'New conversation',
+    'New Conversation',
+    'Untitled conversation',
+    'Untitled',
+    'Untitled project',
+    'Untitled swarm',
+    'Standalone Conversations',
+    'Standalone',
+    'Archived',
+    'Archived Projects',
+    'CLI Project',
+    'Automations',
+    'Pinned Conversations',
+  ]);
 
   function parentElementOrHost(node) {
     if (!node) return null;
@@ -2752,19 +2943,47 @@
     return false;
   }
 
+  function isUserTitleProtectedText(el, rawText) {
+    if (!el || el.nodeType !== 1) return false;
+    for (let p = el; p && p.nodeType === 1; p = parentElementOrHost(p)) {
+      if (p.matches && p.matches(USER_TITLE_TEXT_SELECTOR)) {
+        return !SYSTEM_PLACEHOLDER_TITLES.has((rawText || '').trim());
+      }
+    }
+    return false;
+  }
+
+  function isUserTitleProtectedAttr(el, attr, rawVal) {
+    if (attr !== 'aria-label' && attr !== 'title') return false;
+    if (!el || el.nodeType !== 1 || !el.matches) return false;
+    if (el.tagName === 'A' && el.closest && el.closest('[data-testid^="conversation-row-"]')) {
+      return !SYSTEM_PLACEHOLDER_TITLES.has((rawVal || '').trim());
+    }
+    if (el.matches(USER_TITLE_TEXT_SELECTOR)) {
+      return !SYSTEM_PLACEHOLDER_TITLES.has((rawVal || '').trim());
+    }
+    return false;
+  }
+
   function isContentExcluded(el, attributes) {
     if (!el || el.nodeType !== 1) return true;
     let insideChatUI = false;
     let insideCodeControl = false;
+    let insideMenuOptionLabel = false;
+    let insideMenuCategoryRow = false;
     for (let p = el; p; p = parentElementOrHost(p)) {
       if (isElementSubtreeExcluded(p)) return true;
       if (!attributes && p.tagName === 'TEXTAREA') return true;
+      if (p.matches('[data-testid="menu-option-label"]')) insideMenuOptionLabel = true;
+      if (p.matches('[data-testid="menu-category-row"]')) insideMenuCategoryRow = true;
       // 外层按钮不得放行内部嵌套的聊天正文容器
       if (p.matches(CHAT_PROSE_SELECTOR) && !insideChatUI) return true;
       if (p.matches(CODE_LINE_SELECTOR) && (!attributes || !insideCodeControl)) return true;
       if (p.matches(CHAT_UI_ALLOW_SELECTOR)) insideChatUI = true;
       if (p.matches('button, [role="button"], [role="menuitem"]')) insideCodeControl = true;
     }
+    // 斜杠命令与 @提及菜单选项标签：仅放行官方分类行 (menu-category-row)，命令名与文件名保持原文
+    if (insideMenuOptionLabel && !insideMenuCategoryRow) return true;
     return false;
   }
 
@@ -2794,6 +3013,7 @@
       if (el.hasAttribute(attr)) {
         const val = el.getAttribute(attr);
         if (!val) continue;
+        if (isUserTitleProtectedAttr(el, attr, val)) continue;
         if (cachedAttrs && ownLookup(cachedAttrs, attr) === val) continue;
         const translated = translateString(val);
         if (!cachedAttrs) {
@@ -2829,12 +3049,7 @@
       return null;
     };
 
-    // 1. 兼容旧版规划提示中的动词 "Type"（与表头名词 "Type" 区分）
-    if (trimmed === 'Type' && closest('[data-testid="plan-command-fyi-alert"]')) {
-      return wrap('输入');
-    }
-
-    // 2. "New" / "Beta" / "Legacy" 等模型与特性药丸徽章（含模型菜单内 a3 组件的 rounded-full 角标）
+    // 1. "New" / "Beta" / "Legacy" 等模型与特性药丸徽章（含模型菜单内 a3 组件的 rounded-full 角标）
     //    避免模型旁的 "New" 徽章落入 DICT["New"]="新建" 被误翻为“新建”
     const isPillBadge =
       (parent.tagName === 'DIV' && parent.classList && parent.classList.contains('rounded-full')) ||
@@ -2965,6 +3180,51 @@
       if (trimmed === 'to') return '至';
     }
 
+    // 14. Markdown Alert 标题（仅限 .markdown-alert-title 内，杜绝全局短词误伤）
+    if (closest('.markdown-alert-title')) {
+      const alertMap = {
+        Note: '说明',
+        Tip: '提示',
+        Important: '重要',
+        Warning: '警告',
+        Caution: '注意',
+      };
+      const mapped = ownLookup(alertMap, trimmed);
+      if (mapped) return wrap(mapped);
+    }
+
+    // 15. Swarm 伴生面板专属短词（仅限 [data-testid="swarm-board"] 与空态内，杜绝全局短词误伤）
+    if (closest('[data-testid="swarm-board"], [data-testid="swarm-empty-state"]')) {
+      const swarmShortMap = {
+        Board: '公告板',
+        Live: '实时',
+        Reconnecting: '重连中',
+        Members: '成员',
+        Graph: '关系图',
+        Channels: '频道',
+        Follow: '跟随',
+        Latest: '最新',
+        Hive: '蜂巢视图',
+        Mentions: '提及关系',
+        Frames: '时间帧',
+        Goal: '目标',
+        Threads: '工作线',
+        Progress: '进度',
+        'The team': '成员团队',
+        Team: '成员团队',
+        Coordinator: '协调器',
+        Blocked: '阻塞中',
+        Moving: '推进中',
+        Resting: '休眠中',
+        Retired: '已退出',
+        Stuck: '已卡住',
+        Killed: '已终止',
+        'Waiting on': '等待对象',
+      };
+      const mapped = ownLookup(swarmShortMap, trimmed);
+      if (mapped) return wrap(mapped);
+    }
+
     return null;
   }
 
@@ -3014,6 +3274,7 @@
 
     const parent = parentElementOrHost(node);
     if (!parent || isTextParentExcluded(parent)) return;
+    if (isUserTitleProtectedText(parent, val)) return;
 
     let translated = getContextualTranslation(val, parent, node);
     if (translated === null) {

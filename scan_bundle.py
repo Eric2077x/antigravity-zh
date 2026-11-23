@@ -12,6 +12,8 @@ locales/zh-CN.json（exact / fragments）及 engine/dom-translator.js（DYNAMIC_
 比对覆盖情况。
 """
 
+from __future__ import annotations
+
 import argparse
 import io
 import json
@@ -489,9 +491,26 @@ def check_coverage(cat_map: dict[str, list[str]], zh_data: dict) -> tuple[dict[s
     return missing, stats
 
 
+SWARM_BOARD_DIR = os.path.expanduser("~/.gemini/antigravity/builtin/plugins/swarm/sidecars/swarm_board")
+
+
+def read_swarm_board_sources(swarm_dir: str = SWARM_BOARD_DIR) -> str:
+    """读取本机内置 Swarm 伴生面板前端源码（index.html / app.js / hive.js）。"""
+    parts: list[str] = []
+    for name in ("index.html", "app.js", "hive.js"):
+        fp = os.path.join(swarm_dir, name)
+        if os.path.isfile(fp):
+            with open(fp, "r", encoding="utf-8", errors="replace") as f:
+                parts.append(f.read())
+    if not parts:
+        raise FileNotFoundError(f"未找到内置 Swarm 面板源码目录: {swarm_dir}")
+    return "\n".join(parts)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Antigravity / Gemini 双端内嵌 main.js 漏翻审计")
     parser.add_argument("--live", action="store_true", help="扫描 main.log 中当前运行端口的在线 main.js")
+    parser.add_argument("--swarm", action="store_true", help="一并扫描本机内置 Swarm 伴生面板前端文案")
     parser.add_argument("--limit", type=int, default=40, help="每个分类最多展示的疑漏条目数")
     args = parser.parse_args()
 
@@ -506,6 +525,8 @@ def main() -> int:
             found = next((p for p in candidates if os.path.exists(p)), None)
             if found:
                 targets.append((f"{label} -> {found}", read_embedded_main_js(found)))
+    if args.swarm and os.path.isdir(SWARM_BOARD_DIR):
+        targets.append((f"Swarm Board ({SWARM_BOARD_DIR})", read_swarm_board_sources()))
 
     if not targets:
         print("未找到任何可扫描的 Antigravity / Gemini 目标文件。")

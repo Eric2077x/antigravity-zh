@@ -57,15 +57,11 @@ LS_SHA256_STATE_FILE = os.path.join(BIN_DIR, ".zh_ls_sha256")
 GEMINI_APP_PATH = "/Applications/Gemini.app"
 GEMINI_HELPERS_DIR = os.path.join(GEMINI_APP_PATH, "Contents", "Helpers")
 GEMINI_AGY_BIN = os.path.join(GEMINI_HELPERS_DIR, "agy")
-LEGACY_GEMINI_AGY_ORIG = os.path.join(GEMINI_HELPERS_DIR, ".agy.orig")
-LEGACY_GEMINI_AGY_STAGING = os.path.join(GEMINI_HELPERS_DIR, ".agy.staging")
-LEGACY_GEMINI_AGY_SHA256_STATE_FILE = os.path.join(GEMINI_HELPERS_DIR, ".zh_agy_sha256")
 
 # macOS Gatekeeper first-launch user-approved flag (QTN_FLAG_USER_APPROVED)
 QTN_FLAG_USER_APPROVED = 0x0040
 
 SHARED_BUNDLE_REL_URL = "/static/artifacts/.antigravity-zh/ag-zh.js"
-LEGACY_SHARED_BUNDLE_REL_URL = "/static/artifacts/ag-zh-bundle.js"
 
 OLD_TITLE_PROMPT = (
     b"You are a conversation title generator. The message provided is a transcript of a USER's request "
@@ -824,22 +820,111 @@ def patch_ipc_handlers(dist_dir: str, locale_data: dict) -> None:
     log("已汉化原生右键菜单与文件选择对话框 -> dist/ipcHandlers.js")
 
 
-def patch_loading_overlay(dist_dir: str) -> None:
-    overlay_path = os.path.join(dist_dir, "loadingOverlay.js")
-    if not os.path.isfile(overlay_path):
+def patch_utils(dist_dir: str) -> None:
+    """向 dist/utils.js 注入严格白名单 Swarm 伴生面板 (plugin://swarm--swarm_board-*) 子帧汉化钩子。"""
+    utils_path = os.path.join(dist_dir, "utils.js")
+    if not os.path.isfile(utils_path):
         return
-    with open(overlay_path, "r", encoding="utf-8") as f:
-        content = f.read()
-    if '<div class="text">Loading Antigravity</div>' in content:
-        content = content.replace(
-            '<div class="text">Loading Antigravity</div>',
-            '<div class="text">正在加载 Antigravity...</div>',
-        )
-        with open(overlay_path, "w", encoding="utf-8") as f:
-            f.write(content)
-        log("已汉化启动加载页 -> dist/loadingOverlay.js")
-    else:
-        log("启动加载页已为纯图标模式，跳过文本替换 -> dist/loadingOverlay.js")
+
+    with open(utils_path, "r", encoding="utf-8") as f:
+        content = strip_existing_patch_block(f.read())
+
+    anchor_def = "    win.on('closed', () => {"
+    anchor_off = "        hubContents.off?.('did-fail-load', handleDidFailLoad);"
+    anchor_on = "    hubContents.on('did-fail-load', handleDidFailLoad);"
+
+    if anchor_def not in content or anchor_off not in content or anchor_on not in content:
+        log("警告: dist/utils.js 未命中预期 Swarm 子帧钩子锚点，已安全跳过")
+        return
+
+    swarm_hook_def = (
+        f"    {PATCH_START_MARKER}\n"
+        "    const __agZhGetSwarmEngineSource = () => {\n"
+        "        const preloadPath = require('path').join(__dirname, 'preload.js');\n"
+        "        const cacheKey = '__agZhSwarmEngineCache:' + preloadPath;\n"
+        "        if (typeof globalThis[cacheKey] === 'string') {\n"
+        "            return globalThis[cacheKey];\n"
+        "        }\n"
+        "        try {\n"
+        "            const raw = require('fs').readFileSync(preloadPath, 'utf8');\n"
+        "            const sMarker = '// === ' + 'ANTIGRAVITY_ZH_PATCH_START ===';\n"
+        "            const eMarker = '// === ' + 'ANTIGRAVITY_ZH_PATCH_END ===';\n"
+        "            const sIdx = raw.indexOf(sMarker);\n"
+        "            const eIdx = sIdx !== -1 ? raw.indexOf(eMarker, sIdx + sMarker.length) : -1;\n"
+        "            const extracted = sIdx !== -1 && eIdx !== -1 ? raw.slice(sIdx, eIdx + eMarker.length) : '';\n"
+        "            globalThis[cacheKey] = extracted;\n"
+        "            return extracted;\n"
+        "        } catch (_err) {\n"
+        "            return '';\n"
+        "        }\n"
+        "    };\n"
+        "    const __agZhIsTrustedSwarmFrame = (frameUrl) => {\n"
+        "        if (typeof frameUrl !== 'string' || !frameUrl) return false;\n"
+        "        try {\n"
+        "            const parsed = new URL(frameUrl);\n"
+        "            return (\n"
+        "                parsed.protocol === 'plugin:' &&\n"
+        "                /^swarm--swarm_board-\\d+$/.test(parsed.hostname) &&\n"
+        "                !parsed.port &&\n"
+        "                !parsed.username &&\n"
+        "                !parsed.password &&\n"
+        "                parsed.pathname === '/'\n"
+        "            );\n"
+        "        } catch (_err) {\n"
+        "            return false;\n"
+        "        }\n"
+        "    };\n"
+        "    const __agZhInjectSwarmFrame = (frame) => {\n"
+        "        if (!frame || frame.isDestroyed?.() || typeof frame.executeJavaScript !== 'function') return;\n"
+        "        // 严禁记录 plugin:// URL（query 可能携带一次性认证 Token）\n"
+        "        if (!__agZhIsTrustedSwarmFrame(frame.url)) return;\n"
+        "        const source = __agZhGetSwarmEngineSource();\n"
+        "        if (!source) return;\n"
+        "        const wrapped = `if (!window.__AG_ZH_ENGINE_LOADED__) {\\n${source}\\n}`;\n"
+        "        void Promise.resolve(frame.executeJavaScript(wrapped, false)).catch(() => undefined);\n"
+        "    };\n"
+        "    const handleSwarmSubframeLoad = (_event, isMainFrame, frameProcessId, frameRoutingId) => {\n"
+        "        if (isMainFrame) return;\n"
+        "        try {\n"
+        "            const wfm = require('electron').webFrameMain;\n"
+        "            let targetFrame = null;\n"
+        "            if (typeof frameProcessId === 'number' && typeof frameRoutingId === 'number' && typeof wfm?.fromId === 'function') {\n"
+        "                targetFrame = wfm.fromId(frameProcessId, frameRoutingId);\n"
+        "            }\n"
+        "            if (targetFrame) {\n"
+        "                __agZhInjectSwarmFrame(targetFrame);\n"
+        "                return;\n"
+        "            }\n"
+        "            const subframes = hubContents.mainFrame?.framesInSubtree ?? [];\n"
+        "            for (const f of subframes) {\n"
+        "                if (f && f !== hubContents.mainFrame) {\n"
+        "                    __agZhInjectSwarmFrame(f);\n"
+        "                }\n"
+        "            }\n"
+        "        } catch (_err) {}\n"
+        "    };\n"
+        f"    {PATCH_END_MARKER}\n"
+    )
+    swarm_hook_off = (
+        f"{anchor_off}\n"
+        f"        {PATCH_START_MARKER}\n"
+        "        hubContents.off?.('did-frame-finish-load', handleSwarmSubframeLoad);\n"
+        f"        {PATCH_END_MARKER}"
+    )
+    swarm_hook_on = (
+        f"{anchor_on}\n"
+        f"    {PATCH_START_MARKER}\n"
+        "    hubContents.on('did-frame-finish-load', handleSwarmSubframeLoad);\n"
+        f"    {PATCH_END_MARKER}"
+    )
+
+    updated = content.replace(anchor_def, swarm_hook_def + anchor_def, 1)
+    updated = updated.replace(anchor_off, swarm_hook_off, 1)
+    updated = updated.replace(anchor_on, swarm_hook_on, 1)
+
+    with open(utils_path, "w", encoding="utf-8") as f:
+        f.write(updated)
+    log("已注入 Swarm 白名单伴生面板子帧汉化钩子 -> dist/utils.js")
 
 
 def patch_provision_splash(dist_dir: str) -> None:
@@ -1628,8 +1713,7 @@ def write_shared_web_bundle(locale_data: dict, engine_code: str, home_dir: str) 
     """
     Atomically writes the shared frontend localization bundle to both
     ~/.gemini/antigravity/brain/.antigravity-zh/ag-zh.js (used by Gemini.app with --app_data_dir=antigravity)
-    and ~/.gemini/antigravity-cli/brain/.antigravity-zh/ag-zh.js (used by standalone `agy --hub` without --app_data_dir),
-    and cleans up the legacy bare file.
+    and ~/.gemini/antigravity-cli/brain/.antigravity-zh/ag-zh.js (used by standalone `agy --hub` without --app_data_dir).
     """
     frontend_locale = {
         "version": locale_data.get("version", "2.34.0"),
@@ -1653,14 +1737,6 @@ def write_shared_web_bundle(locale_data: dict, engine_code: str, home_dir: str) 
         _write_exclusive_atomic(bundle_path, bundle_content, 0o644, dir_mode=0o755)
         if not primary_bundle_path:
             primary_bundle_path = bundle_path
-
-        for legacy_name in ("ag-zh-bundle.js", ".ag-zh-bundle.js.staging"):
-            legacy_path = os.path.join(brain_root, legacy_name)
-            if os.path.lexists(legacy_path):
-                try:
-                    os.unlink(legacy_path)
-                except OSError:
-                    pass
 
     log(f"已同步生成共享前端汉化包 -> {primary_bundle_path} 及 antigravity-cli (词条数: {len(frontend_locale['exact'])})")
     return primary_bundle_path
@@ -2163,7 +2239,6 @@ def _select_gemini_base_binary(
 def _is_agy_already_patched_bytes(data: bytes) -> bool:
     return (
         SHARED_BUNDLE_REL_URL.encode("utf-8") in data
-        or LEGACY_SHARED_BUNDLE_REL_URL.encode("utf-8") in data
         or b"ag-zh-bundle.js" in data
         or NEW_TITLE_PROMPT_626 in data
         or NEW_TITLE_PROMPT_522 in data
@@ -2190,26 +2265,6 @@ def ensure_and_patch_gemini_agy(home_dir: str, force: bool = False) -> bool:
     backup_dir, gemini_agy_orig, gemini_agy_sha_file = get_gemini_backup_paths(home_dir)
     os.makedirs(backup_dir, mode=0o700, exist_ok=True)
     os.chmod(backup_dir, 0o700)
-
-    # Migrate and clean legacy in-bundle hidden files and obsolete .swarm_expected marker
-    if not os.path.isfile(gemini_agy_orig) and os.path.isfile(LEGACY_GEMINI_AGY_ORIG) and not os.path.islink(LEGACY_GEMINI_AGY_ORIG):
-        with open(LEGACY_GEMINI_AGY_ORIG, "rb") as lf:
-            legacy_bytes = lf.read()
-        if not _is_agy_already_patched_bytes(legacy_bytes) and _is_trusted_agy_binary(LEGACY_GEMINI_AGY_ORIG):
-            _write_exclusive_atomic(gemini_agy_orig, legacy_bytes, 0o600, dir_mode=0o700)
-
-    for legacy_f in (
-        LEGACY_GEMINI_AGY_ORIG,
-        LEGACY_GEMINI_AGY_SHA256_STATE_FILE,
-        LEGACY_GEMINI_AGY_STAGING,
-        os.path.join(backup_dir, ".swarm_expected"),
-        os.path.join(backup_dir, "gemini_agy_entitlements.plist"),
-    ):
-        if os.path.lexists(legacy_f):
-            try:
-                os.unlink(legacy_f)
-            except OSError:
-                pass
 
     recorded_orig_sha = None
     recorded_base_sha = None
@@ -2317,12 +2372,12 @@ def ensure_and_patch_gemini_agy(home_dir: str, force: bool = False) -> bool:
 def apply_all_patches_to_dir(app_dir: str, locale_data: dict, engine_code: str) -> None:
     dist_dir = os.path.join(app_dir, "dist")
     patch_preload(dist_dir, locale_data, engine_code)
+    patch_utils(dist_dir)
     patch_updater(dist_dir)
     patch_menu(dist_dir, locale_data.get("menu", {}))
     patch_tray(dist_dir)
     patch_main(dist_dir)
     patch_ipc_handlers(dist_dir, locale_data)
-    patch_loading_overlay(dist_dir)
     patch_provision_splash(dist_dir)
     patch_webview_popup_security(dist_dir)
     patch_device_chooser(dist_dir)
@@ -2449,15 +2504,12 @@ def _is_guard_up_to_date(home_dir: str, allow_cache_write: bool = True) -> bool:
     persist_patcher = os.path.join(persist_dir, "patcher.py")
     shared_bundle_file = os.path.join(home_dir, ".gemini", "antigravity", "brain", ".antigravity-zh", "ag-zh.js")
     shared_cli_bundle_file = os.path.join(home_dir, ".gemini", "antigravity-cli", "brain", ".antigravity-zh", "ag-zh.js")
-    legacy_shared_bundle = os.path.join(home_dir, ".gemini", "antigravity", "brain", "ag-zh-bundle.js")
 
     src_mtime = 0.0
     for src_f in (persist_locale, persist_engine, persist_patcher):
         if os.path.isfile(src_f):
             src_mtime = max(src_mtime, os.path.getmtime(src_f))
 
-    if os.path.lexists(legacy_shared_bundle):
-        return False
     for bundle_f in (shared_bundle_file, shared_cli_bundle_file):
         if not os.path.isfile(bundle_f):
             return False
@@ -2469,6 +2521,7 @@ def _is_guard_up_to_date(home_dir: str, allow_cache_write: bool = True) -> bool:
     try:
         if os.path.isdir(APP_PATH) and has_passed_first_launch_gatekeeper(APP_PATH):
             preload_file = os.path.join(UNPACKED_APP_DIR, "dist", "preload.js")
+            utils_file = os.path.join(UNPACKED_APP_DIR, "dist", "utils.js")
             menu_file = os.path.join(UNPACKED_APP_DIR, "dist", "menu.js")
             ipc_file = os.path.join(UNPACKED_APP_DIR, "dist", "ipcHandlers.js")
             if os.path.exists(ASAR_FILE) or not os.path.isfile(preload_file):
@@ -2485,7 +2538,7 @@ def _is_guard_up_to_date(home_dir: str, allow_cache_write: bool = True) -> bool:
                     return False
             except Exception:
                 return False
-            for patched_js in (preload_file, menu_file, ipc_file):
+            for patched_js in (preload_file, utils_file, menu_file, ipc_file):
                 if not os.path.isfile(patched_js):
                     return False
                 with open(patched_js, "r", encoding="utf-8", errors="ignore") as f:
@@ -2771,15 +2824,6 @@ def main() -> None:
     if not os.path.isdir(APP_PATH) and not os.path.isfile(GEMINI_AGY_BIN):
         log(f"错误: 未找到 {APP_PATH} 或 {GEMINI_APP_PATH}，请确认已将应用安装在 /Applications 目录。")
         sys.exit(1)
-
-    # Clean legacy in-dir lock if present
-    persist_dir = os.path.join(home_dir, ".antigravity-zh")
-    legacy_lock = os.path.join(persist_dir, ".patcher.lock")
-    if os.path.lexists(legacy_lock):
-        try:
-            os.unlink(legacy_lock)
-        except OSError:
-            pass
 
     lock_f = acquire_lock(uid, gid, blocking=False)
     if lock_f is None:

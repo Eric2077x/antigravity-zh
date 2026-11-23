@@ -37,6 +37,7 @@ LS_SHA256_STATE_FILE = os.path.join(BIN_DIR, ".zh_ls_sha256")
 GEMINI_APP_PATH = "/Applications/Gemini.app"
 GEMINI_HELPERS_DIR = os.path.join(GEMINI_APP_PATH, "Contents", "Helpers")
 GEMINI_AGY_BIN = os.path.join(GEMINI_HELPERS_DIR, "agy")
+# 仅在卸载脚本中保留早期历史遗留文件的兜底清理，patcher.py 主流程已淘汰旧路径迁移
 LEGACY_GEMINI_AGY_ORIG = os.path.join(GEMINI_HELPERS_DIR, ".agy.orig")
 LEGACY_GEMINI_AGY_STAGING = os.path.join(GEMINI_HELPERS_DIR, ".agy.staging")
 LEGACY_GEMINI_AGY_SHA256_STATE_FILE = os.path.join(GEMINI_HELPERS_DIR, ".zh_agy_sha256")
