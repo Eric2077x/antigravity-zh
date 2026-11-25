@@ -2794,6 +2794,88 @@ def _append_guard_log(home_dir: str, text: str) -> None:
         pass
 
 
+def _is_macos_app_running(exec_path: str) -> bool:
+    """通过绝对路径 /bin/ps 精确检查指定可执行路径的 macOS 应用主进程是否正在运行。"""
+    try:
+        out = subprocess.check_output(
+            ["/bin/ps", "-axo", "comm="],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+        )
+        return any(line.strip() == exec_path for line in out.splitlines())
+    except Exception:
+        return False
+
+
+def _send_macos_notification(title: str, subtitle: str, message: str, uid: int) -> None:
+    """通过 /usr/bin/osascript 安全传参发送 macOS 原生系统通知（零字符串拼接注入，失败静默跳过）。"""
+    cmd = [
+        "/usr/bin/osascript",
+        "-e",
+        "on run argv",
+        "-e",
+        "display notification (item 1 of argv) with title (item 2 of argv) subtitle (item 3 of argv)",
+        "-e",
+        "end run",
+        "--",
+        message,
+        title,
+        subtitle,
+    ]
+    if os.geteuid() == 0 and uid != 0:
+        cmd = ["/bin/launchctl", "asuser", str(uid)] + cmd
+    try:
+        subprocess.run(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+    except Exception:
+        pass
+
+
+def _notify_guard_sync_result(
+    uid: int,
+    ag_had_live_asar: bool,
+    app_version: str,
+    gemini_patched: bool,
+) -> None:
+    """后台守护完成双端汉化同步后，按实际更新端与运行状态发出一条简明 macOS 通知。"""
+    ag_synced = app_version not in ("", "missing", "deferred")
+    if not ag_synced and not gemini_patched:
+        return
+
+    ag_running = _is_macos_app_running(os.path.join(APP_PATH, "Contents", "MacOS", "Antigravity"))
+    gem_running = _is_macos_app_running(os.path.join(GEMINI_APP_PATH, "Contents", "MacOS", "Gemini"))
+    ver_tag = f"v{app_version}" if ag_synced and app_version != "unknown" else "新版本"
+
+    title = "Antigravity 汉化守护"
+    if ag_had_live_asar and ag_synced:
+        subtitle = f"已自动补好 {ver_tag} 汉化"
+        if ag_running and gemini_patched and gem_running:
+            message = "请按 Cmd + Q 完全退出并重开 Antigravity 与 Gemini 生效。"
+        elif ag_running:
+            message = "请按 Cmd + Q 完全退出 Antigravity 后重开生效。"
+        else:
+            message = "新版本汉化已自动同步，下次打开即生效。"
+    elif gemini_patched:
+        subtitle = "Gemini 内置 Antigravity 已同步汉化"
+        if gem_running:
+            message = "重切面板或按 Cmd + Q 重开 Gemini 即可生效。"
+        else:
+            message = "内置版汉化已自动同步，下次打开即生效。"
+    else:
+        subtitle = "双端汉化已自动同步"
+        if ag_running or gem_running:
+            message = "按 Cmd + R 刷新窗口（若刚更新过请按 Cmd + Q 重开）生效。"
+        else:
+            message = "汉化已同步完成，下次打开即生效。"
+
+    _send_macos_notification(title, subtitle, message, uid)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Antigravity & Gemini 内置 Antigravity 双端完整汉化与同步工具")
     parser.add_argument("--force", action="store_true", help="强制重新解包/修补 Antigravity.app 与 Gemini.app")
@@ -2852,9 +2934,11 @@ def main() -> None:
         write_shared_web_bundle(locale_data, engine_code, home_dir)
         persist_backup_dir, gemini_agy_orig, gemini_agy_sha_file = get_gemini_backup_paths(home_dir)
 
+        ag_had_live_asar = os.path.isfile(ASAR_FILE)
+        app_version = "missing"
         try:
             if os.path.isdir(APP_PATH):
-                ensure_and_patch_app(locale_data, engine_code, force=args.force, home_dir=home_dir)
+                app_version = ensure_and_patch_app(locale_data, engine_code, force=args.force, home_dir=home_dir)
             gemini_patched = ensure_and_patch_gemini_agy(home_dir=home_dir, force=args.force)
         except PermissionError:
             msg = (
@@ -2921,6 +3005,7 @@ def main() -> None:
         if args.guard:
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             _append_guard_log(home_dir, f"[{ts}] [Guard] 双端汉化同步完成。\n")
+            _notify_guard_sync_result(uid, ag_had_live_asar, app_version, gemini_patched)
         elif inside_ag:
             log("Antigravity & Gemini 双端完整汉化同步成功！（当前在 Antigravity 内部运行，按 Cmd + R 重新加载窗口生效）")
         else:
